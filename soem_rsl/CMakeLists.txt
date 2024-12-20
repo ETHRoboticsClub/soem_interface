@@ -79,39 +79,50 @@ ament_export_libraries(soem_rsl)
 
 target_include_directories(soem_rsl PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/soem_rsl/soem_rsl>
-  $<INSTALL_INTERFACE:include/soem_rsl/soem_rsl>)
+    $<INSTALL_INTERFACE:include/soem_rsl>)
 
 target_include_directories(soem_rsl PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/soem_rsl/osal>
-  $<INSTALL_INTERFACE:include/soem_rsl/soem_rsl>)
+    $<INSTALL_INTERFACE:include/soem_rsl>)
 
 target_include_directories(soem_rsl PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/soem_rsl/osal/${OS}>
-  $<INSTALL_INTERFACE:include/soem_rsl/soem_rsl>)
+    $<INSTALL_INTERFACE:include/soem_rsl>)
 
 target_include_directories(soem_rsl
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/soem_rsl/oshw/${OS}>
-  $<INSTALL_INTERFACE:include/soem_rsl/soem_rsl>)
+    $<INSTALL_INTERFACE:include/soem_rsl>)
 
 message("LIB_DIR: ${soem_rsl_LIB_INSTALL_DIR}")
 
-install(TARGETS soem_rsl EXPORT soem_rslConfig DESTINATION ${soem_rsl_LIB_INSTALL_DIR})
+message("CMAKE_INSTALL_PREFIX" : ${CMAKE_INSTALL_PREFIX})
 
-install(EXPORT soem_rslConfig DESTINATION share/soem_rsl/cmake)
 
 install(FILES
-  ${soem_rsl_HEADERS}
-  ${OSAL_HEADERS}
-  ${OSHW_HEADERS}
-  DESTINATION ${soem_rsl_INCLUDE_INSTALL_DIR}
+    ${soem_rsl_HEADERS}
+    ${OSAL_HEADERS}
+    ${OSHW_HEADERS}
+    DESTINATION include/${PROJECT_NAME}/${PROJECT_NAME}
 )
+
+
+install(
+    TARGETS soem_rsl
+    EXPORT export_${PROJECT_NAME}
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
+ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+
 
 install(FILES
   ./soem_rsl/soem_rsl/ethercattype.h
-  DESTINATION ${CMAKE_INSTALL_PREFIX}/include
+    DESTINATION ${CMAKE_INSTALL_PREFIX}/include/${PROJECT_NAME}
 )
 
-ament_export_include_directories(include)
+ament_export_include_directories(include/${PROJECT_NAME})
 
 #message(${CMAKE_INSTALL_PREFIX})
 #add_custom_target(link_target ALL
