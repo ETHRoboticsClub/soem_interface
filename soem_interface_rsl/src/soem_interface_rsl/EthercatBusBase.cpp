@@ -25,6 +25,8 @@
 
 #include <soem_rsl/ethercat.h>
 
+#include <sstream>
+
 namespace soem_interface_rsl {
 
 static bool busIsAvailable(const std::string& name) {
@@ -256,19 +258,16 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     //! Check the working counter.
     if (wkc_ < expectedWorkingCounter) {
       ++workingCounterTooLowCounter_;
-      MELO_DEBUG_STREAM("[soem_interface_rsl::" << name_ << "] Working counter too low counter: " << workingCounterTooLowCounter_)
-      MELO_DEBUG_THROTTLE_STREAM(1.0, "[soem_interface_rsl::" << getName() << "] Update Read:" << this);
-      MELO_WARN_STREAM("[soem_interface_rsl::" << name_ << "] Working counter is too low: " << wkc_.load() << " < "
-                                               << expectedWorkingCounter << ", wkc's to low in a row: " << workingCounterTooLowCounter_);
-      {
-        std::lock_guard<std::mutex> guard(contextMutex_);
-        MELO_WARN_STREAM("[soem_interface_rsl" << name_ << "] For all slaves alStatusCode: 0x" << std::setfill('0') << std::setw(8)
-                                               << std::hex << ecatContext_.slavelist[0].ALstatuscode << " "
-                                               << ec_ALstatuscode2string(ecatContext_.slavelist[0].ALstatuscode));
+      if (workingCounterTooLowCounter_ == 1) {
+        logSlaveStatesOnWorkingCounterDrop(expectedWorkingCounter);
       }
+      // The running count is part of the message, so one line per period already tells how long the bus has been degraded.
+      MELO_WARN_THROTTLE_STREAM(wkcTooLowLogPeriodSec_, "[soem_interface_rsl::" << name_ << "] Working counter is too low: " << wkc_.load()
+                                                        << " < " << expectedWorkingCounter << " (" << workingCounterTooLowCounter_
+                                                        << " cycles in a row)");
       if (workingCounterTooLowCounter_ > maxWorkingCounterTooLow_) {
-        MELO_ERROR_THROTTLE_STREAM(1.0, "[soem_interface_rsl" << name_ << "] Bus is not ok. Too many working counter too low in a row: "
-                                                              << workingCounterTooLowCounter_)
+        MELO_ERROR_THROTTLE_STREAM(wkcTooLowLogPeriodSec_, "[soem_interface_rsl::" << name_ << "] Bus is not ok. Too many working counter too low in a row: "
+                                                           << workingCounterTooLowCounter_)
       }
       return;
     }
@@ -362,6 +361,27 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   }
 
   bool busIsOk() const { return workingCounterTooLowCounter_ < maxWorkingCounterTooLow_; }
+
+  // One AL-state read on the edge into a too-low working counter. The cyclic path never refreshes AL status, so
+  // without this the reason for the drop (e.g. 0x1B "Sync manager watchdog" after a process-data gap) is only
+  // visible when bus diagnosis is enabled. ecx_readstate batches the reads, so this costs one or two frames once per edge.
+  void logSlaveStatesOnWorkingCounterDrop(int expectedWorkingCounter) {
+    getState(0);
+    std::ostringstream notOperational;
+    {
+      std::lock_guard<std::mutex> guard(contextMutex_);
+      for (const auto& slave : slaves_) {
+        const ec_slavet& ecatSlave = ecatContext_.slavelist[slave->getAddress()];
+        if ((ecatSlave.state & 0x0f) == EC_STATE_OPERATIONAL) {
+          continue;
+        }
+        notOperational << ' ' << slave->getName() << '=' << EthercatBusBase::getStateString(ecatSlave.state) << "/0x" << std::hex
+                       << ecatSlave.ALstatuscode << std::dec << " (" << ec_ALstatuscode2string(ecatSlave.ALstatuscode) << ')';
+      }
+    }
+    MELO_WARN_STREAM("[soem_interface_rsl::" << name_ << "] Working counter dropped to " << wkc_.load() << " < " << expectedWorkingCounter
+                                             << ". Slaves not in OPERATIONAL:" << (notOperational.str().empty() ? " none" : notOperational.str()));
+  }
 
   bool doBusMonitoring(bool logErrorCounterForDiagnosis) {
     if (!initlialized_) {
@@ -768,6 +788,8 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   unsigned int workingCounterTooLowCounter_{0};
   //! Maximal number of working counter to low.
   const unsigned int maxWorkingCounterTooLow_{100};
+  //! Minimum spacing of the working-counter warnings; the cyclic loop would otherwise emit one line per bus cycle.
+  const double wkcTooLowLogPeriodSec_{1.0};
 
   //! Bus Diagnosis Counters, and dl status log
   BusDiagnosisLog busDiagnosisLog_{};
