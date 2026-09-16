@@ -605,10 +605,20 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     return pdoMap;
   }
 
+  // A mailbox transfer to a slave the started bus does not hold (the bus not
+  // started yet, or an address past the scan) fails like any other transfer;
+  // it must not take the master down.
+  bool slaveOnBus(const uint16_t slave, const char* what) const {
+    if (slave >= 1 && static_cast<int>(slave) <= *ecatContext_.slavecount) return true;
+    MELO_ERROR_STREAM("[soem_interface_rsl::" << name_ << "] " << what << ": slave " << slave << " is not on the bus ("
+                                              << *ecatContext_.slavecount << " slave(s) configured).");
+    return false;
+  }
+
   bool sdoWrite(const uint16_t slave, const uint16_t index, const uint8_t subindex, const bool completeAccess, int size, void* buf) {
     int wkc = 0;
     {
-      assert(static_cast<int>(slave) <= *ecatContext_.slavecount);
+      if (!slaveOnBus(slave, __func__)) return false;
       std::lock_guard<std::mutex> guard(contextMutex_);
       if (cyclicActive_) return false; // Runtime callers must use requestSdo().
       wkc = ecx_SDOwrite(&ecatContext_, slave, index, subindex, static_cast<boolean>(completeAccess), size, buf, EC_TIMEOUTRXM);
@@ -637,7 +647,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     int requestedSize = size;
     int wkc = 0;
     {
-      assert(static_cast<int>(slave) <= *ecatContext_.slavecount);
+      if (!slaveOnBus(slave, __func__)) return false;
       std::lock_guard<std::mutex> guard(contextMutex_);
       if (cyclicActive_) return false; // Runtime callers must use requestSdo().
       wkc = ecx_SDOread(&ecatContext_, slave, index, subindex, static_cast<boolean>(completeAccess), &size, buf, EC_TIMEOUTRXM);
@@ -672,7 +682,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   int sdoReadSize(const uint16_t slave, const uint16_t index, const uint8_t subindex, const bool completeAccess, int size, void* buf) {
     int wkc = 0;
     {
-      assert(static_cast<int>(slave) <= *ecatContext_.slavecount);
+      if (!slaveOnBus(slave, __func__)) return 0;
       std::lock_guard<std::mutex> guard(contextMutex_);
       if (cyclicActive_) return false; // Runtime callers must use requestSdo().
       wkc = ecx_SDOread(&ecatContext_, slave, index, subindex, static_cast<boolean>(completeAccess), &size, buf, EC_TIMEOUTRXM);
