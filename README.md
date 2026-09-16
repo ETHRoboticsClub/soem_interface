@@ -84,7 +84,8 @@ backlog is bounded at 64 requests and reports `Unavailable` when full.
 
 Working-counter edges coalesce into asynchronous AL-state sweeps. Periodic
 monitoring uses the same pump, including error counters. `getSlaveALStatus`
-reports the last observation (or unavailable), not a fresh synchronous bus read.
+reports the last observation (or unavailable), not a fresh synchronous bus read;
+an observed state of NONE means the slave answered nothing and is off the bus.
 The application must call `EthercatMaster::logBusDiagnosis` from its non-cyclic
 executor to write enabled diagnostic logs. The controls application does this in
 its status callback.

@@ -143,6 +143,8 @@ class SOEM_RSL_EXPORT EthercatBusBase : private EthercatBusBaseTemplateAdapter {
    */
   void updateRead();
 
+  // The last AL-state sweep's answer for a slave. `observed` with `state`
+  // EC_STATE_NONE means the slave answered nothing: it is off the bus.
   struct SlaveALStatus { bool observed; uint16_t state, code; };
   SlaveALStatus getSlaveALStatus(uint16_t slave) const;
   int getWorkingCounter() const;

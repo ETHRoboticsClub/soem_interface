@@ -425,8 +425,11 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
           slave.ALstatuscode = data[4] | (uint16_t(data[5]) << 8);
           observedAL_[address].store(uint32_t(slave.state) | (uint32_t(slave.ALstatuscode) << 16));
         } else {
+          // No answer is an observation: the slave is off the bus (Timeout,
+          // TransportError). A cancelled or unavailable read says nothing.
           slave.state = EC_STATE_NONE;
-          observedAL_[address].store(kUnobservedAL);
+          const bool silent = status == MailboxStatus::Timeout || status == MailboxStatus::TransportError;
+          observedAL_[address].store(silent ? uint32_t(EC_STATE_NONE) : kUnobservedAL);
         }
         if (diagnosticCounters_) {
           diagnosticRequest_ = mailbox_.submit(MailboxRequest::Kind::Register, address,
