@@ -125,6 +125,13 @@ class SOEM_RSL_EXPORT EthercatSlaveBase {
    * @param value          Value to write.
    * @return True if successful.
    */
+  MailboxRequest::Ptr requestSdo(uint16_t index, uint8_t subindex, uint8_t size,
+                               bool write = false, uint32_t value = 0) {
+    // Bus/address are fixed during operation; never hold the device lock while
+    // awaiting a mailbox response.
+    return bus_->requestSdo(address_, index, subindex, size, write, value);
+  }
+
   template <typename Value>
   bool sendSdoWrite(const uint16_t index, const uint8_t subindex, const bool completeAccess, const Value value) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);

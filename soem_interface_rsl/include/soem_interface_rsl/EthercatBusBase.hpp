@@ -36,6 +36,7 @@
 // soem_interface_rsl
 
 #include <soem_interface_rsl/common/soem_rsl_export.h>
+#include <soem_interface_rsl/AsyncMailbox.hpp>
 #include <soem_interface_rsl/common/EthercatTypes.hpp>
 #include <soem_interface_rsl/common/ExtendedRegisters.hpp>
 #include <soem_interface_rsl/common/Macros.hpp>
@@ -141,6 +142,13 @@ class SOEM_RSL_EXPORT EthercatBusBase : private EthercatBusBaseTemplateAdapter {
    * Update step 1: Read all PDOs.
    */
   void updateRead();
+
+  struct SlaveALStatus { bool observed; uint16_t state, code; };
+  SlaveALStatus getSlaveALStatus(uint16_t slave) const;
+  int getWorkingCounter() const;
+
+  MailboxRequest::Ptr requestSdo(uint16_t slave, uint16_t index, uint8_t subindex,
+                               uint8_t size, bool write = false, uint32_t value = 0);
 
   /*!
    * Update step 2: Write all PDOs.

@@ -109,6 +109,8 @@ int ecx_closenic(ecx_portt *port);
 void ecx_setbufstat(ecx_portt *port, int idx, int bufstat);
 int ecx_getindex(ecx_portt *port);
 int ecx_outframe(ecx_portt *port, int idx, int sock);
+/* Single nonblocking receive attempt; preserves other outstanding indices. */
+int ecx_inframe(ecx_portt *port, int idx, int stacknumber);
 int ecx_outframe_red(ecx_portt *port, int idx);
 int ecx_waitinframe(ecx_portt *port, int idx, int timeout);
 int ecx_srconfirm(ecx_portt *port, int idx,int timeout);

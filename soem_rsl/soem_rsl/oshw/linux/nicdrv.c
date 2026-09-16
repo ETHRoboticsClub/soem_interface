@@ -282,7 +282,7 @@ int ecx_outframe(ecx_portt *port, int idx, int stacknumber)
    }
    lp = (*stack->txbuflength)[idx];
    (*stack->rxbufstat)[idx] = EC_BUF_TX;
-   rval = send(*stack->sock, (*stack->txbuf)[idx], lp, 0);
+   rval = send(*stack->sock, (*stack->txbuf)[idx], lp, MSG_DONTWAIT);
    if (rval == -1)
    {
       (*stack->rxbufstat)[idx] = EC_BUF_EMPTY;
@@ -319,7 +319,7 @@ int ecx_outframe_red(ecx_portt *port, int idx)
       ehp->sa1 = htons(secMAC[1]);
       /* transmit over secondary socket */
       port->redport->rxbufstat[idx] = EC_BUF_TX;
-      if (send(port->redport->sockhandle, &(port->txbuf2), port->txbuflength2 , 0) == -1)
+      if (send(port->redport->sockhandle, &(port->txbuf2), port->txbuflength2 , MSG_DONTWAIT) == -1)
       {
          port->redport->rxbufstat[idx] = EC_BUF_EMPTY;
       }
@@ -348,7 +348,7 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
       stack = &(port->redport->stack);
    }
    lp = sizeof(port->tempinbuf);
-   bytesrx = recv(*stack->sock, (*stack->tempbuf), lp, 0);
+   bytesrx = recv(*stack->sock, (*stack->tempbuf), lp, MSG_DONTWAIT);
    port->tempinbufs = bytesrx;
 
    return (bytesrx > 0);

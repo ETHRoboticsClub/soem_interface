@@ -65,3 +65,26 @@ Due to the current pandemic we could not test this version of the soem_interface
 
 Tests will be conducted as soon as possible.
 
+
+## Runtime mailbox ownership
+
+`EthercatBusBase::requestSdo` queues expedited CoE reads/writes (1–4 bytes,
+no complete access). Poll the returned `MailboxRequest::status`; read its result
+only after an acquire load observes completion. Queueing is not confirmation.
+The cyclic bus owner advances one nonblocking datagram step per update. Gain
+clients also require matching readback before declaring a pair applied.
+
+Synchronous SDO calls are for startup/configuration outside OP and return failure
+in OP. Leaving OP cancels pending requests. An uncertain transaction after sending
+a mailbox request quarantines that slave's mailbox until the bus is recreated and initialized;
+other slaves and PDO exchange continue. A SAFE_OP/OP toggle does not clear quarantine. Callers must retain an unknown/failed
+result, never treat cancellation or timeout as proof that a write did not happen.
+The 700 ms lifetime is SOEM's existing mailbox timeout, not a cyclic wait. The
+backlog is bounded at 64 requests and reports `Unavailable` when full.
+
+Working-counter edges coalesce into asynchronous AL-state sweeps. Periodic
+monitoring uses the same pump, including error counters. `getSlaveALStatus`
+reports the last observation (or unavailable), not a fresh synchronous bus read.
+The application must call `EthercatMaster::logBusDiagnosis` from its non-cyclic
+executor to write enabled diagnostic logs. The controls application does this in
+its status callback.

@@ -29,6 +29,45 @@
 
 namespace soem_interface_rsl {
 
+// Accessed only by the bus owner while contextMutex_ is held.
+class SoemMailboxTransport final : public MailboxTransport {
+ public:
+  explicit SoemMailboxTransport(ecx_contextt& context) : context_(context) {}
+  MailboxEndpoint endpoint(uint16_t slave) const override {
+    const auto& s = context_.slavelist[slave];
+    return {s.mbx_wo, s.mbx_l, s.mbx_ro, s.mbx_rl};
+  }
+  uint8_t nextCounter(uint16_t slave) override {
+    auto& count = context_.slavelist[slave].mbx_cnt;
+    count = ec_nextmbxcnt(count);
+    return count;
+  }
+  bool start(uint16_t slave, uint16_t reg, bool write, const uint8_t* data, uint16_t size) override {
+    index_ = ecx_getindex(context_.port);
+    size_ = size;
+    ecx_setupdatagram(context_.port, &context_.port->txbuf[index_], write ? EC_CMD_FPWR : EC_CMD_FPRD,
+                     index_, context_.slavelist[slave].configadr, reg, size, const_cast<uint8_t*>(data));
+    if (ecx_outframe(context_.port, index_, 0) <= 0) { cancel(); return false; }
+    return true;
+  }
+  int poll(uint8_t* data) override {
+    const int wkc = ecx_inframe(context_.port, index_, 0);
+    if (wkc < 0) return -1;
+    if (wkc == 1) std::memcpy(data, &context_.port->rxbuf[index_][EC_HEADERSIZE], size_);
+    cancel();
+    return wkc == 1 ? 1 : 0;
+  }
+  void cancel() override {
+    if (index_ >= 0) ecx_setbufstat(context_.port, index_, EC_BUF_EMPTY);
+    index_ = -1;
+  }
+ private:
+  ecx_contextt& context_;
+  int index_{-1};
+  uint16_t size_{0};
+};
+static_assert(AsyncMailbox::kMaxMailbox == EC_MAXMBX);
+
 static bool busIsAvailable(const std::string& name) {
   ec_adaptert* adapter = ec_find_adapters();
   while (adapter != nullptr) {
@@ -56,6 +95,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     ecatContext_.port->redport = nullptr;
     //  ecatContext_.idxstack->data = nullptr; // This does not compile since soem_rsl uses a fixed size array of void pointers.
     ecatContext_.FOEhook = nullptr;
+    for (auto& status : observedAL_) status.store(kUnobservedAL);
   }
 
   const std::string& getName() const { return name_; }
@@ -253,13 +293,14 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
       wkc_ = ecx_receive_processdata(&ecatContext_, EC_TIMEOUTRET);
     }
     sentProcessData_ = false;
+    serviceMailbox();
 
     int expectedWorkingCounter = ecatContext_.grouplist[0].outputsWKC * 2 + ecatContext_.grouplist[0].inputsWKC;
     //! Check the working counter.
     if (wkc_ < expectedWorkingCounter) {
       ++workingCounterTooLowCounter_;
       if (workingCounterTooLowCounter_ == 1) {
-        logSlaveStatesOnWorkingCounterDrop(expectedWorkingCounter);
+        diagnosticSweep_ = true;
       }
       // The running count is part of the message, so one line per period already tells how long the bus has been degraded.
       MELO_WARN_THROTTLE_STREAM(wkcTooLowLogPeriodSec_, "[soem_interface_rsl::" << name_ << "] Working counter is too low: " << wkc_.load()
@@ -362,28 +403,80 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
   bool busIsOk() const { return workingCounterTooLowCounter_ < maxWorkingCounterTooLow_; }
 
-  // One AL-state read on the edge into a too-low working counter. The cyclic path never refreshes AL status, so
-  // without this the reason for the drop (e.g. 0x1B "Sync manager watchdog" after a process-data gap) is only
-  // visible when bus diagnosis is enabled. ecx_readstate batches the reads, so this costs one or two frames once per edge.
-  void logSlaveStatesOnWorkingCounterDrop(int expectedWorkingCounter) {
-    getState(0);
-    std::ostringstream notOperational;
-    {
-      std::lock_guard<std::mutex> guard(contextMutex_);
-      for (const auto& slave : slaves_) {
-        const ec_slavet& ecatSlave = ecatContext_.slavelist[slave->getAddress()];
-        if ((ecatSlave.state & 0x0f) == EC_STATE_OPERATIONAL) {
-          continue;
-        }
-        notOperational << ' ' << slave->getName() << '=' << EthercatBusBase::getStateString(ecatSlave.state) << "/0x" << std::hex
-                       << ecatSlave.ALstatuscode << std::dec << " (" << ec_ALstatuscode2string(ecatSlave.ALstatuscode) << ')';
-      }
-    }
-    MELO_WARN_STREAM("[soem_interface_rsl::" << name_ << "] Working counter dropped to " << wkc_.load() << " < " << expectedWorkingCounter
-                                             << ". Slaves not in OPERATIONAL:" << (notOperational.str().empty() ? " none" : notOperational.str()));
+  MailboxRequest::Ptr requestSdo(uint16_t slave, uint16_t index, uint8_t sub, uint8_t size,
+                                 bool write, uint32_t value) {
+    return mailbox_.submit(write ? MailboxRequest::Kind::Write : MailboxRequest::Kind::Read,
+                           slave, index, sub, size, value);
   }
 
+  void serviceMailbox() {
+    std::lock_guard<std::mutex> guard(contextMutex_);
+    if (!cyclicActive_) return;
+    mailbox_.tick();
+    if (diagnosticRequest_) {
+      const auto status = diagnosticRequest_->status.load(std::memory_order_acquire);
+      if (status == MailboxStatus::Pending) return;
+      const auto address = slaves_[diagnosticSlave_]->getAddress();
+      auto& slave = ecatContext_.slavelist[address];
+      if (diagnosticRequest_->index == ECT_REG_ALSTAT) {
+        if (status == MailboxStatus::Success) {
+          const auto& data = diagnosticRequest_->registers;
+          slave.state = data[0] | (uint16_t(data[1]) << 8);
+          slave.ALstatuscode = data[4] | (uint16_t(data[5]) << 8);
+          observedAL_[address].store(uint32_t(slave.state) | (uint32_t(slave.ALstatuscode) << 16));
+        } else {
+          slave.state = EC_STATE_NONE;
+          observedAL_[address].store(kUnobservedAL);
+        }
+        if (diagnosticCounters_) {
+          diagnosticRequest_ = mailbox_.submit(MailboxRequest::Kind::Register, address,
+              static_cast<uint16_t>(REG::ERROR_COUNTERS::FRAME_ERROR_PORT0_ADDR), 0,
+              REG::ERROR_COUNTERS_LIST.memorySize());
+          return;
+        }
+      } else if (status == MailboxStatus::Success) {
+        size_t i = 0;
+        auto* raw = reinterpret_cast<std::byte*>(diagnosticRequest_->registers.data());
+        for (const auto& reg : REG::ERROR_COUNTERS_LIST) {
+          const auto value = REG::ERROR_COUNTERS_LIST.getValueFromRawAs<uint8_t>(
+              reg.addrEnum, raw, REG::ERROR_COUNTERS_LIST.memorySize());
+          auto& counter = busDiagnosisLog_.errorCounters_[diagnosticSlave_][i++];
+          counter.fullValue += static_cast<uint8_t>(value - counter.previousValue);
+          counter.previousValue = value;
+        }
+      }
+      diagnosticRequest_.reset();
+      if (++diagnosticSlave_ == slaves_.size()) {
+        diagnosticSlave_ = 0;
+        diagnosticSweep_ = false;
+        busDiagnosisLog_.ecatApplicationLayerStatus = EC_STATE_OPERATIONAL;
+        for (const auto& device : slaves_) {
+          const auto previous = busDiagnosisLog_.ecatApplicationLayerStatus;
+          const auto state = ecatContext_.slavelist[device->getAddress()].state;
+          busDiagnosisLog_.ecatApplicationLayerStatus = std::min(int(previous & 0x0f), int(state & 0x0f)) |
+                                                       ((previous | state) & EC_STATE_ERROR);
+        }
+        busDiagnosisLog_.fullyUpdated = true;
+      }
+    }
+    if (diagnosticSweep_ && !slaves_.empty()) {
+      diagnosticRequest_ = mailbox_.submit(MailboxRequest::Kind::Register,
+          slaves_[diagnosticSlave_]->getAddress(), ECT_REG_ALSTAT, 0, 6);
+    }
+  }
+
+  EthercatBusBase::SlaveALStatus getSlaveALStatus(uint16_t slave) const {
+    const uint32_t value = slave < EC_MAXSLAVE ? observedAL_[slave].load() : kUnobservedAL;
+    return {value != kUnobservedAL, uint16_t(value), uint16_t(value >> 16)};
+  }
+  int getWorkingCounter() const { return wkc_.load(); }
+
   bool doBusMonitoring(bool logErrorCounterForDiagnosis) {
+    if (cyclicActive_) {
+      diagnosticSweep_ = true;
+      diagnosticCounters_ = logErrorCounterForDiagnosis;
+      return busIsOk();
+    }
     if (!initlialized_) {
       return false;
     }
@@ -474,9 +567,10 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   }
 
   bool getBusDiagnosisLog(BusDiagnosisLog& busDiagnosisLogOut) {
+    std::lock_guard<std::mutex> guard(contextMutex_);
     if (busDiagnosisLog_.fullyUpdated) {
-      // is called in the update loop, therefore not thread safe implemented here..
       busDiagnosisLogOut = busDiagnosisLog_;
+      busDiagnosisLog_.fullyUpdated = false;
       return true;
     }
     return false;
@@ -513,6 +607,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     {
       assert(static_cast<int>(slave) <= *ecatContext_.slavecount);
       std::lock_guard<std::mutex> guard(contextMutex_);
+      if (cyclicActive_) return false; // Runtime callers must use requestSdo().
       wkc = ecx_SDOwrite(&ecatContext_, slave, index, subindex, static_cast<boolean>(completeAccess), size, buf, EC_TIMEOUTRXM);
     }
     if (wkc <= 0) {
@@ -541,6 +636,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     {
       assert(static_cast<int>(slave) <= *ecatContext_.slavecount);
       std::lock_guard<std::mutex> guard(contextMutex_);
+      if (cyclicActive_) return false; // Runtime callers must use requestSdo().
       wkc = ecx_SDOread(&ecatContext_, slave, index, subindex, static_cast<boolean>(completeAccess), &size, buf, EC_TIMEOUTRXM);
     }
     if (wkc <= 0) {
@@ -575,6 +671,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     {
       assert(static_cast<int>(slave) <= *ecatContext_.slavecount);
       std::lock_guard<std::mutex> guard(contextMutex_);
+      if (cyclicActive_) return false; // Runtime callers must use requestSdo().
       wkc = ecx_SDOread(&ecatContext_, slave, index, subindex, static_cast<boolean>(completeAccess), &size, buf, EC_TIMEOUTRXM);
     }
     if (wkc <= 0) {
@@ -615,7 +712,16 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
  private:
   uint16_t getState(const uint16_t slave) {
     std::lock_guard<std::mutex> guard(contextMutex_);
-    int lowest_state = ecx_readstate(&ecatContext_);
+    int lowest_state = EC_STATE_OPERATIONAL;
+    if (cyclicActive_) {
+      for (int i = 1; i <= *ecatContext_.slavecount; ++i) {
+        const auto state = ecatContext_.slavelist[i].state;
+        lowest_state = std::min(lowest_state & 0x0f, int(state & 0x0f)) |
+                       ((lowest_state | state) & EC_STATE_ERROR);
+      }
+    } else {
+      lowest_state = ecx_readstate(&ecatContext_);
+    }
 
     // ecx_readstate updates reads all slaves in worst case with one datagram per slaves, and or's all the ALStatusCodes.
     // therefore we update here the bus AL StatusCode which is the OR of all slave's ALStatusCode!
@@ -630,6 +736,15 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     if (!initlialized_) {
       MELO_WARN_STREAM("[soem_interface_rsl::" << name_ << "] Bus " << name_ << " was not successfully initialized, skipping operation");
       return;
+    }
+    if (slave == 0) {
+      cyclicActive_ = state == EC_STATE_OPERATIONAL;
+      if (cyclicActive_) mailbox_.enable(*ecatContext_.slavecount);
+      else mailbox_.disable();
+      diagnosticRequest_.reset();
+      for (auto& status : observedAL_) status.store(kUnobservedAL);
+      diagnosticSlave_ = 0;
+      diagnosticSweep_ = false;
     }
     ecatContext_.slavelist[slave].state = state;
     if (state == EC_STATE_OPERATIONAL) {
@@ -860,6 +975,15 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
                                nullptr,
                                nullptr,
                                0};
+  SoemMailboxTransport mailboxTransport_{ecatContext_};
+  AsyncMailbox mailbox_{mailboxTransport_};
+  bool cyclicActive_{false}; // protected by contextMutex_
+  bool diagnosticSweep_{false}, diagnosticCounters_{false};
+  static constexpr uint32_t kUnobservedAL = 0xffffffff;
+  std::array<std::atomic<uint32_t>, EC_MAXSLAVE> observedAL_{};
+  size_t diagnosticSlave_{0};
+  MailboxRequest::Ptr diagnosticRequest_;
+
 };
 
 EthercatBusBaseTemplateAdapter::EthercatBusBaseTemplateAdapter(const std::string& name)
@@ -1074,3 +1198,17 @@ bool EthercatBusBase::sendSdoWrite<std::string>(const uint16_t slave, const uint
 }
 
 }  // namespace soem_interface_rsl
+
+namespace soem_interface_rsl {
+MailboxRequest::Ptr EthercatBusBase::requestSdo(uint16_t slave, uint16_t index, uint8_t subindex,
+                                              uint8_t size, bool write, uint32_t value) {
+  return pImpl_->requestSdo(slave, index, subindex, size, write, value);
+}
+} // namespace soem_interface_rsl
+
+namespace soem_interface_rsl {
+EthercatBusBase::SlaveALStatus EthercatBusBase::getSlaveALStatus(uint16_t slave) const {
+  return pImpl_->getSlaveALStatus(slave);
+}
+int EthercatBusBase::getWorkingCounter() const { return pImpl_->getWorkingCounter(); }
+} // namespace soem_interface_rsl
