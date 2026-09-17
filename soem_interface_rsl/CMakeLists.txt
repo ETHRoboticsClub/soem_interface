@@ -45,6 +45,7 @@ add_library(
   src/${PROJECT_NAME}/EthercatSlaveBase.cpp
   src/${PROJECT_NAME}/EthercatBusManagerBase.cpp
   src/${PROJECT_NAME}/EthercatBusBase.cpp
+  src/${PROJECT_NAME}/SoemTransport.cpp
 )
 
 
@@ -85,5 +86,11 @@ install(
     RUNTIME DESTINATION bin
     INCLUDES DESTINATION include
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(bus_core_test test/bus_core_test.cpp)
+  target_link_libraries(bus_core_test ${PROJECT_NAME})
+endif()
 
 ament_package()

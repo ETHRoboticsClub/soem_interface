@@ -37,6 +37,7 @@
 
 #include <soem_interface_rsl/common/soem_rsl_export.h>
 #include <soem_interface_rsl/AsyncMailbox.hpp>
+#include <soem_interface_rsl/BusTransport.hpp>
 #include <soem_interface_rsl/common/EthercatTypes.hpp>
 #include <soem_interface_rsl/common/ExtendedRegisters.hpp>
 #include <soem_interface_rsl/common/Macros.hpp>
@@ -64,7 +65,7 @@ class SOEM_RSL_EXPORT EthercatBusBaseTemplateAdapter {
   void writeRxPdoForward(const uint16_t slave, int size, const void* buf);
 
  public:
-  explicit EthercatBusBaseTemplateAdapter(const std::string& name);
+  explicit EthercatBusBaseTemplateAdapter(std::unique_ptr<BusTransport> transport);
   ~EthercatBusBaseTemplateAdapter();
 };
 
@@ -79,10 +80,16 @@ class SOEM_RSL_EXPORT EthercatBusBase : private EthercatBusBaseTemplateAdapter {
 
   EthercatBusBase() = delete;
   /*!
-   * Constructor.
+   * Constructor for a SOEM bus on a NIC.
    * @param name Name of the bus, e.g. "eth0".
    */
   explicit EthercatBusBase(const std::string& name);
+
+  /*!
+   * Constructor over an explicit transport (SOEM or a fake CoE segment). The
+   * bus core above the transport is the same either way.
+   */
+  explicit EthercatBusBase(std::unique_ptr<BusTransport> transport);
 
   /*!
    * Destructor.
@@ -96,14 +103,14 @@ class SOEM_RSL_EXPORT EthercatBusBase : private EthercatBusBaseTemplateAdapter {
   const std::string& getName() const;
 
   /*!
-   * Check if a bus is available.
+   * Check if a NIC is available to SOEM.
    * @param name Name of the bus.
    * @return True if available.
    */
   static bool busIsAvailable(const std::string& name);
 
   /*!
-   * Print all available busses.
+   * Print all NICs available to SOEM.
    */
   static void printAvailableBusses();
 
