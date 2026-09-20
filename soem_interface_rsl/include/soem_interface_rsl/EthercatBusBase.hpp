@@ -155,6 +155,9 @@ class SOEM_RSL_EXPORT EthercatBusBase : private EthercatBusBaseTemplateAdapter {
   struct SlaveALStatus { bool observed; uint16_t state, code; };
   SlaveALStatus getSlaveALStatus(uint16_t slave) const;
   int getWorkingCounter() const;
+  // True while the bus is in OP: the synchronous SDO calls are refused then
+  // and callers must use requestSdo().
+  bool cyclicActive() const;
 
   MailboxRequest::Ptr requestSdo(uint16_t slave, uint16_t index, uint8_t subindex,
                                uint8_t size, bool write = false, uint32_t value = 0);

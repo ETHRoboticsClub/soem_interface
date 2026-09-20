@@ -408,6 +408,10 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     return {value != kUnobservedAL, uint16_t(value), uint16_t(value >> 16)};
   }
   int getWorkingCounter() const { return wkc_.load(); }
+  bool cyclicActive() {
+    std::lock_guard<std::mutex> guard(contextMutex_);
+    return cyclicActive_;
+  }
 
   bool doBusMonitoring(bool logErrorCounterForDiagnosis) {
     if (cyclicActive_) {
@@ -1064,5 +1068,6 @@ EthercatBusBase::SlaveALStatus EthercatBusBase::getSlaveALStatus(uint16_t slave)
   return pImpl_->getSlaveALStatus(slave);
 }
 int EthercatBusBase::getWorkingCounter() const { return pImpl_->getWorkingCounter(); }
+bool EthercatBusBase::cyclicActive() const { return pImpl_->cyclicActive(); }
 
 }  // namespace soem_interface_rsl
