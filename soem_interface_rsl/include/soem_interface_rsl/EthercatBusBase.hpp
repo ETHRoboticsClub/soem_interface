@@ -209,6 +209,16 @@ class SOEM_RSL_EXPORT EthercatBusBase : private EthercatBusBaseTemplateAdapter {
   bool waitForState(const uint16_t state, const uint16_t slave = 0, const unsigned int maxRetries = 40);
   bool waitForState(ETHERCAT_SM_STATE state, const uint16_t slave = 0, const unsigned int maxRetries = 40);
 
+  // Bounded bus-wide state change for leaving OP: every slave that answers is
+  // taken to `state`; a slave that answers nothing (off the bus: its AL status
+  // reads NONE) is reported and skipped instead of holding the transition. The
+  // wait is one kAlStateProbe per slave plus one kAlStateSettle shared by the
+  // slaves still in transition, so a dead slave never turns a shutdown into
+  // the slave-0 wait's retries. True when every answering slave reached `state`.
+  bool setStateSkippingSilent(ETHERCAT_SM_STATE state);
+  static constexpr std::chrono::milliseconds kAlStateProbe{20};
+  static constexpr std::chrono::milliseconds kAlStateSettle{2000};  // EC_TIMEOUTSTATE
+
   /*!
    * Reads the ethercat state machine state, updates the state information of all slaves.
    * Therefore reads all slaves in case not all slaves are in the same state.

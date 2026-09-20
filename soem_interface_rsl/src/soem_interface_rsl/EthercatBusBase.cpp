@@ -21,6 +21,8 @@
 */
 
 #include <soem_interface_rsl/EthercatBusBase.hpp>
+
+#include <algorithm>
 #include <soem_interface_rsl/EthercatSlaveBase.hpp>
 
 // Only the ETG constants, error-string tables and SOEM timeouts; every segment
@@ -283,11 +285,8 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     if (initlialized_) {
       {
         std::lock_guard<std::mutex> guard(contextMutex_);
-        // Set the slaves to state Init.
-        if (transport_->slaveCount() > 0) {
-          setStateLocked(EC_STATE_INIT);
-          waitForStateLocked(EC_STATE_INIT);
-        }
+        // Set the slaves to state Init; a slave off the bus cannot hold this up.
+        if (transport_->slaveCount() > 0) setStateSkippingSilentLocked(EC_STATE_INIT);
       }  // release the contextMutex_ in case slave wants to do low_level commands at shutdown.
       for (auto& slave : slaves_) {
         slave->shutdown();
@@ -301,6 +300,11 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     // Sleep to make sure the socket is closed, because ecx_close is non-blocking.
     soem_interface_rsl::threadSleep(0.5);
     initlialized_ = false;
+  }
+
+  bool setStateSkippingSilent(const uint16_t state) {
+    std::lock_guard<std::mutex> guard(contextMutex_);
+    return setStateSkippingSilentLocked(state);
   }
 
   void setState(const uint16_t state, const uint16_t slave = 0) {
@@ -690,6 +694,46 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     }
   }
 
+  bool setStateSkippingSilentLocked(const uint16_t state) {
+    const std::string& name_ = getName();
+    if (!initlialized_) {
+      MELO_WARN_STREAM("[soem_interface_rsl::" << name_ << "] Bus " << name_ << " was not successfully initialized, skipping operation");
+      return false;
+    }
+    setStateLocked(state);
+    const auto probe = std::chrono::duration_cast<std::chrono::microseconds>(EthercatBusBase::kAlStateProbe);
+    std::vector<uint16_t> pending;
+    std::vector<std::string> silent;
+    for (uint16_t address = 1; address <= static_cast<uint16_t>(slaves_.size()); ++address) {
+      const uint16_t observed = transport_->awaitAlState(address, state, probe);
+      if (observed == state) continue;
+      if (observed == EC_STATE_NONE) silent.push_back(slaves_[address - 1]->getName());
+      else pending.push_back(address);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + EthercatBusBase::kAlStateSettle;
+    bool reached = true;
+    for (const uint16_t address : pending) {
+      const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::max(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now()));
+      const uint16_t observed = transport_->awaitAlState(address, state, remaining);
+      if (observed == state) continue;
+      if (observed == EC_STATE_NONE) {
+        silent.push_back(slaves_[address - 1]->getName());
+        continue;
+      }
+      reached = false;
+      MELO_WARN_STREAM("[soem_interface_rsl::" << name_ << "] Slave " << slaves_[address - 1]->getName() << ": target state "
+                                               << EthercatBusBase::getStateString(state) << " not reached within "
+                                               << EthercatBusBase::kAlStateSettle.count() << " ms; current state 0x" << std::hex
+                                               << observed << std::dec);
+    }
+    for (const auto& slave : silent) {
+      MELO_WARN_STREAM("[soem_interface_rsl::" << name_ << "] Slave " << slave << " answers nothing (off the bus); its "
+                                               << EthercatBusBase::getStateString(state) << " transition is not waited for");
+    }
+    return reached;
+  }
+
   bool waitForStateLocked(const uint16_t state, const uint16_t slave = 0, const unsigned int maxRetries = 20) {
     const std::string& name_ = getName();
     if (!initlialized_) {
@@ -947,6 +991,10 @@ bool EthercatBusBase::waitForState(const uint16_t state, const uint16_t slave, c
 }
 bool EthercatBusBase::waitForState(soem_interface_rsl::ETHERCAT_SM_STATE state, const uint16_t slave, const unsigned int maxRetries) {
   return pImpl_->waitForState(static_cast<uint16_t>(state), slave, maxRetries);
+}
+
+bool EthercatBusBase::setStateSkippingSilent(soem_interface_rsl::ETHERCAT_SM_STATE state) {
+  return pImpl_->setStateSkippingSilent(static_cast<uint16_t>(state));
 }
 
 bool EthercatBusBase::busIsOk() const {
