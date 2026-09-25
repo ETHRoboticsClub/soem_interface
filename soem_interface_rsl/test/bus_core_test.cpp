@@ -226,7 +226,9 @@ struct Fixture {
 
 TEST(BusCore, StartupOrdersDiscoveryPreOpSlaveStartupThenMapping) {
   Fixture f;
+  EXPECT_FALSE(f.bus->getStartupSlaveCountMismatch().has_value());
   ASSERT_TRUE(f.startup());
+  EXPECT_FALSE(f.bus->getStartupSlaveCountMismatch().has_value());
   const std::vector<std::string> expected{
       "open", "detect", "enumerate", "al:0:2", "slave.startup:s1", "slave.startup:s2", "map"};
   std::vector<std::string> seen;
@@ -241,13 +243,53 @@ TEST(BusCore, StartupOrdersDiscoveryPreOpSlaveStartupThenMapping) {
   }
 }
 
-TEST(BusCore, EnumerationShortOfExpectedSlavesFailsStartupAndClosesThePort) {
+TEST(BusCore, EnumerationCountMismatchAfterSuccessfulDetectionRetainsCountsAndClosesBeforeConfiguration) {
+  for (const int observed : {0, 1, 3}) {
+    SCOPED_TRACE(observed);
+    Fixture f;
+    f.transport->detected_ = 2;
+    f.transport->enumerated_ = observed;
+    ASSERT_FALSE(f.startup());
+    EXPECT_EQ(f.log.events, (std::vector<std::string>{"open", "detect", "enumerate", "close"}));
+    EXPECT_FALSE(f.transport->open_);
+    EXPECT_FALSE(f.bus->cyclicActive());
+    EXPECT_EQ(f.bus->getNumberOfSlaves(), 0);
+    const auto mismatch = f.bus->getStartupSlaveCountMismatch();
+    ASSERT_TRUE(mismatch.has_value());
+    EXPECT_EQ(mismatch->phase, EthercatBusBase::StartupSlaveCountMismatch::Phase::Enumeration);
+    EXPECT_EQ(mismatch->expected, 2);
+    EXPECT_EQ(mismatch->observed, observed);
+  }
+}
+
+TEST(BusCore, DiscoveryCountMismatchRetainsObservedCountWithoutEnumerating) {
+  for (const int observed : {0, 1, 3}) {
+    SCOPED_TRACE(observed);
+    Fixture f;
+    f.transport->detected_ = observed;
+    ASSERT_FALSE(f.startup());
+    EXPECT_EQ(f.log.events, (std::vector<std::string>{"open", "detect", "close"}));
+    EXPECT_FALSE(f.transport->open_);
+    const auto mismatch = f.bus->getStartupSlaveCountMismatch();
+    ASSERT_TRUE(mismatch.has_value());
+    EXPECT_EQ(mismatch->phase, EthercatBusBase::StartupSlaveCountMismatch::Phase::Discovery);
+    EXPECT_EQ(mismatch->expected, 2);
+    EXPECT_EQ(mismatch->observed, observed);
+  }
+}
+
+TEST(BusCore, NextStartupAttemptClearsPreviousCountMismatchEvenWhenBusIsUnavailable) {
   Fixture f;
   f.transport->enumerated_ = 1;
-  EXPECT_FALSE(f.startup());
-  EXPECT_EQ(f.log.events.back(), "close");
-  EXPECT_EQ(std::count(f.log.events.begin(), f.log.events.end(), "map"), 0);
-  EXPECT_EQ(f.bus->getNumberOfSlaves(), 0);
+  ASSERT_FALSE(f.startup());
+  ASSERT_TRUE(f.bus->getStartupSlaveCountMismatch().has_value());
+  f.transport->available_ = false;
+  ASSERT_FALSE(f.startup());
+  EXPECT_FALSE(f.bus->getStartupSlaveCountMismatch().has_value());
+  f.transport->available_ = true;
+  f.transport->enumerated_ = 2;
+  ASSERT_TRUE(f.startup());
+  EXPECT_FALSE(f.bus->getStartupSlaveCountMismatch().has_value());
 }
 
 TEST(BusCore, SlaveStartupFailureStopsBeforeMapping) {

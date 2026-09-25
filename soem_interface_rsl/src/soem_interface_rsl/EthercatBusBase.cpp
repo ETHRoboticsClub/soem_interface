@@ -72,6 +72,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   }
 
   bool startup(std::atomic<bool>& abortFlag, const bool sizeCheck, int maxDiscoverRetries) {
+    startupSlaveCountMismatch_.reset();
     const std::string& name_ = getName();
     if (!busIsAvailable()) {
       const std::string why = transport_->availabilityDiagnosis();
@@ -95,13 +96,17 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
           transport_->close();
           return false;  // avoid that executation continues.
         }
-        if (transport_->detectSlaves() == static_cast<int>(slaves_.size())) {
+        const int detected = transport_->detectSlaves();
+        if (detected == static_cast<int>(slaves_.size())) {
           // on some of the older (rsl) anydrives there seems to be a short race between bus is responsive and slave is fully ready...
           // so give them this 1 sec to be fully ready to be started...
           soem_interface_rsl::threadSleep(1.0);
           break;
         }
         if (retry == maxDiscoverRetries) {
+          startupSlaveCountMismatch_ = EthercatBusBase::StartupSlaveCountMismatch{
+              EthercatBusBase::StartupSlaveCountMismatch::Phase::Discovery,
+              static_cast<int>(slaves_.size()), detected};
           MELO_ERROR_STREAM("[soem_interface_rsl::" << name_ << "] "
                                                     << "No slaves have been found.");
           transport_->close();
@@ -115,7 +120,11 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
       // A slot that answered the scan but failed its identity/mailbox setup
       // leaves the segment unusable; the bus cannot be configured around it.
-      if (transport_->enumerate() != static_cast<int>(slaves_.size())) {
+      const int enumerated = transport_->enumerate();
+      if (enumerated != static_cast<int>(slaves_.size())) {
+        startupSlaveCountMismatch_ = EthercatBusBase::StartupSlaveCountMismatch{
+            EthercatBusBase::StartupSlaveCountMismatch::Phase::Enumeration,
+            static_cast<int>(slaves_.size()), enumerated};
         MELO_ERROR_STREAM("[soem_interface_rsl::" << name_ << "] "
                                                   << "Slave enumeration did not configure every expected slave.");
         transport_->close();
@@ -217,6 +226,10 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     workingCounterTooLowCounter_ = 0;
 
     return true;
+  }
+
+  std::optional<EthercatBusBase::StartupSlaveCountMismatch> getStartupSlaveCountMismatch() const {
+    return startupSlaveCountMismatch_;
   }
 
   void updateRead() {
@@ -848,6 +861,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
   std::unique_ptr<BusTransport> transport_;
   AsyncMailbox mailbox_;
+  std::optional<EthercatBusBase::StartupSlaveCountMismatch> startupSlaveCountMismatch_;
 
   //! Whether the bus has been initialized successfully
   bool initlialized_{false};
@@ -963,6 +977,10 @@ bool EthercatBusBase::startup(const bool sizeCheck, int maxDiscoverRetries) {
 
 bool EthercatBusBase::startup(std::atomic<bool>& abortFlag, const bool sizeCheck, int maxDiscoverRetries) {
   return pImpl_->startup(abortFlag, sizeCheck, maxDiscoverRetries);
+}
+
+std::optional<EthercatBusBase::StartupSlaveCountMismatch> EthercatBusBase::getStartupSlaveCountMismatch() const {
+  return pImpl_->getStartupSlaveCountMismatch();
 }
 
 void EthercatBusBase::updateRead() {

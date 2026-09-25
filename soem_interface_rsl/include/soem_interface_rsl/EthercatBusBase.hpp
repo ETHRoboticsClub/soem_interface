@@ -25,6 +25,7 @@
 // std
 #include <atomic>
 #include <chrono>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -144,6 +145,17 @@ class SOEM_RSL_EXPORT EthercatBusBase : private EthercatBusBaseTemplateAdapter {
   bool startup(bool sizeCheck, int maxDiscoverRetries = 10);
 
   bool startup(std::atomic<bool>& abortFlag, bool sizeCheck, int maxDiscoverRetries = 10);
+
+  struct StartupSlaveCountMismatch {
+    enum class Phase { Discovery, Enumeration };
+    Phase phase;
+    int expected;
+    int observed;
+  };
+
+  // Read after startup returns and before shutdown. Preserved when failed
+  // startup closes the transport; reset by the next startup attempt.
+  std::optional<StartupSlaveCountMismatch> getStartupSlaveCountMismatch() const;
 
   /*!
    * Update step 1: Read all PDOs.
