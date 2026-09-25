@@ -168,6 +168,18 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
       waitForStateLocked(EC_STATE_PRE_OP, 0);
     }
 
+    // Validate the entire live chain before any slave startup can configure a drive.
+    bool preflightOk = true;
+    for (auto& slave : slaves_) {
+      if (abortFlag) return false;
+      if (!slave->preflightStartup()) {
+        MELO_ERROR_STREAM("[soem_interface_rsl::" << name_ << "] Slave '" << slave->getName()
+                          << "' failed read-only startup preflight.");
+        preflightOk = false;
+      }
+    }
+    if (!preflightOk) return false;
+
     // Initialize the communication interfaces of all slaves.
     for (auto& slave : slaves_) {
       MELO_INFO_STREAM("[soem_interface_rsl::" << name_ << "] Starting slave: " << slave->getName())

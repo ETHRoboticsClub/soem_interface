@@ -69,6 +69,9 @@ class SOEM_RSL_EXPORT EthercatSlaveBase {
    */
   virtual std::string getName() const = 0;
 
+  // Read-only checks for every attached slave run before startup may write to any slave.
+  virtual bool preflightStartup() { return true; }
+
   /**
    * @brief      Startup non-ethercat specific objects for the slave
    *
