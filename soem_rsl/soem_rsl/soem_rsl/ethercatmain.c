@@ -21,18 +21,6 @@
 #include "oshw.h"
 #include "ethercat.h"
 
-#ifdef EC_ERRORLIST_THREADSAFE
-#include <pthread.h>
-/* Mailbox transfers to distinct slaves may run on concurrent threads, and any
- * of them can push an error; the list's head/tail updates must not interleave. */
-static pthread_mutex_t ec_errorlist_mutex = PTHREAD_MUTEX_INITIALIZER;
-#define EC_ERRORLIST_LOCK() pthread_mutex_lock(&ec_errorlist_mutex)
-#define EC_ERRORLIST_UNLOCK() pthread_mutex_unlock(&ec_errorlist_mutex)
-#else
-#define EC_ERRORLIST_LOCK()
-#define EC_ERRORLIST_UNLOCK()
-#endif
-
 
 /** delay in us for eeprom ready loop */
 #define EC_LOCALDELAY  200
@@ -163,7 +151,6 @@ void ec_free_adapters (ec_adaptert * adapter)
  */
 void ecx_pusherror(ecx_contextt *context, const ec_errort *Ec)
 {
-   EC_ERRORLIST_LOCK();
    context->elist->Error[context->elist->head] = *Ec;
    context->elist->Error[context->elist->head].Signal = TRUE;
    context->elist->head++;
@@ -180,7 +167,6 @@ void ecx_pusherror(ecx_contextt *context, const ec_errort *Ec)
       context->elist->tail = 0;
    }
    *(context->ecaterror) = TRUE;
-   EC_ERRORLIST_UNLOCK();
 }
 
 /** Pops an error from the list.
@@ -191,10 +177,7 @@ void ecx_pusherror(ecx_contextt *context, const ec_errort *Ec)
  */
 boolean ecx_poperror(ecx_contextt *context, ec_errort *Ec)
 {
-   boolean notEmpty;
-
-   EC_ERRORLIST_LOCK();
-   notEmpty = (context->elist->head != context->elist->tail);
+   boolean notEmpty = (context->elist->head != context->elist->tail);
 
    *Ec = context->elist->Error[context->elist->tail];
    context->elist->Error[context->elist->tail].Signal = FALSE;
@@ -210,7 +193,6 @@ boolean ecx_poperror(ecx_contextt *context, ec_errort *Ec)
    {
       *(context->ecaterror) = FALSE;
    }
-   EC_ERRORLIST_UNLOCK();
    return notEmpty;
 }
 

@@ -7,12 +7,8 @@
 #include <soem_interface_rsl/EthercatSlaveBase.hpp>
 
 #include <algorithm>
-#include <atomic>
-#include <condition_variable>
 #include <deque>
 #include <map>
-#include <mutex>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -23,43 +19,9 @@ namespace {
 
 constexpr uint16_t kInit = 0x01, kPreOp = 0x02, kSafeOp = 0x04, kOp = 0x08, kNone = 0x00;
 
-// Written from slave startup workers; read only once they joined.
 struct Log {
-  std::mutex mutex;
   std::vector<std::string> events;
-  void add(const std::string& event) {
-    std::lock_guard<std::mutex> lock(mutex);
-    events.push_back(event);
-  }
-};
-
-// Counts the per-slave transfers in flight. Until `rendezvous` transfers have
-// been in flight together once, a transfer waits for that to happen, so a core
-// that never overlaps them fails the wait instead of passing by luck.
-struct Overlap {
-  std::mutex mutex;
-  std::condition_variable changed;
-  int inFlight{0}, maxInFlight{0}, rendezvous{0};
-  bool met{false}, timedOut{false}, sameSlaveOverlapped{false};
-  std::map<uint16_t, int> perSlave;
-  std::chrono::milliseconds hold{0}, patience{5000};
-
-  void transfer(uint16_t slave) {
-    std::unique_lock<std::mutex> lock(mutex);
-    if (++perSlave[slave] > 1) sameSlaveOverlapped = true;
-    maxInFlight = std::max(maxInFlight, ++inFlight);
-    if (inFlight >= rendezvous) met = true;
-    changed.notify_all();
-    // system_clock: GCC 11's steady wait_for uses pthread_cond_clockwait,
-    // which ThreadSanitizer does not intercept.
-    if (!changed.wait_until(lock, std::chrono::system_clock::now() + patience, [&] { return met; }))
-      timedOut = true;
-    lock.unlock();
-    std::this_thread::sleep_for(hold);
-    lock.lock();
-    --perSlave[slave];
-    --inFlight;
-  }
+  void add(const std::string& event) { events.push_back(event); }
 };
 
 // A mailbox wire whose replies are scripted per submitted request.
@@ -111,10 +73,6 @@ struct ScriptedTransport final : BusTransport {
   int sdoResult_{1};
   int sdoReadSize_{-1}; // bytes a read answers; -1 answers exactly what was asked
   ScriptedMailbox mailbox_;
-  unsigned concurrent_{1};
-  Overlap overlap_;
-
-  unsigned concurrentSlaves() const override { return concurrent_; }
 
   const std::string& name() const override { return name_; }
   bool available() const override { return available_; }
@@ -167,7 +125,6 @@ struct ScriptedTransport final : BusTransport {
     return lowest();
   }
   uint16_t awaitAlState(uint16_t slave, uint16_t, std::chrono::microseconds) override {
-    if (slave != 0) overlap_.transfer(slave);
     return slave == 0 ? lowest() : al_[slave].state;
   }
   AlStatus alStatus(uint16_t slave) const override {
@@ -177,13 +134,11 @@ struct ScriptedTransport final : BusTransport {
   int sdoWrite(uint16_t slave, uint16_t index, uint8_t, bool, int, const void*,
                std::chrono::microseconds) override {
     log_.add("sdoWrite:" + std::to_string(slave) + ":" + std::to_string(index));
-    overlap_.transfer(slave);
     return sdoResult_;
   }
   int sdoRead(uint16_t slave, uint16_t index, uint8_t, bool, int& size, void* data,
               std::chrono::microseconds) override {
     log_.add("sdoRead:" + std::to_string(slave) + ":" + std::to_string(index));
-    overlap_.transfer(slave);
     if (sdoReadSize_ >= 0)
       size = std::min(size, sdoReadSize_);
     std::fill_n(static_cast<uint8_t*>(data), size, 0x5A);
@@ -217,23 +172,11 @@ struct ScriptedSlave final : EthercatSlaveBase {
   Log& log_;
   std::string name_;
   bool startupResult{true};
-  bool throwOnStartup{false};
-  int configurationWrites{0}; // the way an SDK configures its drive
-  std::atomic<bool>* abortOnStartup{nullptr};
   PdoInfo info{0, 0, 15, 20, 0};
   std::vector<uint8_t> lastRead;
   std::string getName() const override { return name_; }
   bool startup() override {
     log_.add("slave.startup:" + name_);
-    if (abortOnStartup != nullptr) *abortOnStartup = true;
-    if (throwOnStartup) throw std::runtime_error("startup threw: " + name_);
-    if (configurationWrites > 0) {
-      bool ok = bus_->waitForState(ETHERCAT_SM_STATE::PRE_OP, static_cast<uint16_t>(address_));
-      for (int i = 0; i < configurationWrites; ++i)
-        ok &= sendSdoWrite<uint32_t>(0x2000, static_cast<uint8_t>(i + 1), false, 7);
-      ok &= bus_->getHardwarePdoSizes(static_cast<uint16_t>(address_)).first == 15;
-      if (!ok) return false;
-    }
     return startupResult;
   }
   void updateRead() override {
@@ -349,94 +292,10 @@ TEST(BusCore, NextStartupAttemptClearsPreviousCountMismatchEvenWhenBusIsUnavaila
   EXPECT_FALSE(f.bus->getStartupSlaveCountMismatch().has_value());
 }
 
-TEST(BusCore, SlaveStartupFailureStartsTheOthersButStopsBeforeMapping) {
-  for (const unsigned concurrent : {1u, 3u}) {
-    SCOPED_TRACE(concurrent);
-    Fixture f(4);
-    f.transport->concurrent_ = concurrent;
-    f.slaves[0]->startupResult = false;
-    f.slaves[2]->startupResult = false;
-    EXPECT_FALSE(f.startup());
-    for (const auto* name : {"s1", "s2", "s3", "s4"})
-      EXPECT_EQ(std::count(f.log.events.begin(), f.log.events.end(),
-                           std::string("slave.startup:") + name), 1)
-          << "every failure is reported, not just the first";
-    EXPECT_EQ(std::count(f.log.events.begin(), f.log.events.end(), "map"), 0);
-  }
-}
-
-TEST(BusCore, SerialTransportStartsSlavesInAddressOrderOneTransferAtATime) {
-  Fixture f(4);
-  for (auto& slave : f.slaves) slave->configurationWrites = 3;
-  f.transport->overlap_.hold = std::chrono::milliseconds(1);
-  ASSERT_TRUE(f.startup());
-  EXPECT_EQ(f.transport->overlap_.maxInFlight, 1);
-  std::vector<std::string> order;
-  for (const auto& e : f.log.events)
-    if (e.rfind("slave.startup:", 0) == 0) order.push_back(e);
-  EXPECT_EQ(order, (std::vector<std::string>{"slave.startup:s1", "slave.startup:s2",
-                                             "slave.startup:s3", "slave.startup:s4"}));
-}
-
-TEST(BusCore, ConcurrentTransportOverlapsDistinctSlavesUpToItsBoundBeforeMapping) {
-  Fixture f(7);
-  for (auto& slave : f.slaves) slave->configurationWrites = 3;
-  f.transport->concurrent_ = 3;
-  f.transport->overlap_.rendezvous = 3;
-  f.transport->overlap_.hold = std::chrono::milliseconds(2);
-  ASSERT_TRUE(f.startup());
-  EXPECT_FALSE(f.transport->overlap_.timedOut) << "three slaves were never configured together";
-  EXPECT_EQ(f.transport->overlap_.maxInFlight, 3) << "the transport's bound is never exceeded";
-  EXPECT_FALSE(f.transport->overlap_.sameSlaveOverlapped);
-  const auto map = std::find(f.log.events.begin(), f.log.events.end(), "map");
-  ASSERT_NE(map, f.log.events.end());
-  for (int slave = 1; slave <= 7; ++slave) {
-    const auto write = "sdoWrite:" + std::to_string(slave) + ":" + std::to_string(0x2000);
-    EXPECT_EQ(std::count(f.log.events.begin(), map, write), 3) << "slave " << slave;
-    EXPECT_EQ(std::count(map, f.log.events.end(), write), 0) << "configuration precedes mapping";
-  }
-}
-
-TEST(BusCore, AccessOutsideSlaveStartupStaysExclusive) {
-  Fixture f(2);
-  f.transport->concurrent_ = 2;
-  ASSERT_TRUE(f.startup());
-  // Two transfers that would meet if the core let them overlap.
-  f.transport->overlap_.maxInFlight = 0;
-  f.transport->overlap_.rendezvous = 2;
-  f.transport->overlap_.met = false;
-  f.transport->overlap_.patience = std::chrono::milliseconds(200);
-  std::thread other([&] { EXPECT_TRUE(f.bus->sendSdoWrite<uint32_t>(2, 0x2000, 1, false, 7)); });
-  EXPECT_TRUE(f.bus->sendSdoWrite<uint32_t>(1, 0x2000, 1, false, 7));
-  other.join();
-  EXPECT_EQ(f.transport->overlap_.maxInFlight, 1);
-  EXPECT_TRUE(f.transport->overlap_.timedOut);
-}
-
-TEST(BusCore, ThrowingSlaveStartupRethrowsOnceTheOthersFinished) {
-  Fixture f(5);
-  f.transport->concurrent_ = 3;
-  f.slaves[1]->throwOnStartup = true;
-  EXPECT_THROW(f.startup(), std::runtime_error);
-  for (const auto* name : {"s1", "s3", "s4", "s5"})
-    EXPECT_EQ(std::count(f.log.events.begin(), f.log.events.end(),
-                         std::string("slave.startup:") + name), 1);
-  EXPECT_EQ(std::count(f.log.events.begin(), f.log.events.end(), "map"), 0);
-  f.transport->overlap_.maxInFlight = 0;
-  f.transport->overlap_.rendezvous = 2;
-  f.transport->overlap_.met = false;
-  f.transport->overlap_.patience = std::chrono::milliseconds(200);
-  std::thread other([&] { f.bus->sendSdoWrite<uint32_t>(2, 0x2000, 1, false, 7); });
-  f.bus->sendSdoWrite<uint32_t>(1, 0x2000, 1, false, 7);
-  other.join();
-  EXPECT_EQ(f.transport->overlap_.maxInFlight, 1) << "the exception left the concurrent mode";
-}
-
-TEST(BusCore, AbortDuringSlaveStartupStartsNoFurtherSlaveAndDoesNotMap) {
-  Fixture f(3);
-  std::atomic<bool> abort{false};
-  f.slaves[0]->abortOnStartup = &abort;
-  EXPECT_FALSE(f.bus->startup(abort, true, 0));
+TEST(BusCore, SlaveStartupFailureStopsBeforeMapping) {
+  Fixture f;
+  f.slaves[0]->startupResult = false;
+  EXPECT_FALSE(f.startup());
   EXPECT_EQ(std::count(f.log.events.begin(), f.log.events.end(), "slave.startup:s2"), 0);
   EXPECT_EQ(std::count(f.log.events.begin(), f.log.events.end(), "map"), 0);
 }
