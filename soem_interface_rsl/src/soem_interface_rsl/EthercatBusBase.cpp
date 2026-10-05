@@ -97,12 +97,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
           return false;  // avoid that executation continues.
         }
         const int detected = transport_->detectSlaves();
-        if (detected == static_cast<int>(slaves_.size())) {
-          // on some of the older (rsl) anydrives there seems to be a short race between bus is responsive and slave is fully ready...
-          // so give them this 1 sec to be fully ready to be started...
-          soem_interface_rsl::threadSleep(1.0);
-          break;
-        }
+        if (detected == static_cast<int>(slaves_.size())) break;
         if (retry == maxDiscoverRetries) {
           startupSlaveCountMismatch_ = EthercatBusBase::StartupSlaveCountMismatch{
               EthercatBusBase::StartupSlaveCountMismatch::Phase::Discovery,
