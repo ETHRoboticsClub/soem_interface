@@ -76,6 +76,12 @@ public:
   }
   ~SoemTransport() override { close(); }
 
+  // Each per-slave call blocks on one datagram at a time, holding one of SOEM's
+  // EC_MAXBUF frame indices; ecx_getindex reuses a busy index once all are
+  // taken, so more concurrent slaves would cross their replies.
+#ifdef EC_ERRORLIST_THREADSAFE
+  unsigned concurrentSlaves() const override { return EC_MAXBUF; }
+#endif
   const std::string& name() const override { return name_; }
   bool available() const override { return soemInterfaceExists(name_); }
   bool open() override {

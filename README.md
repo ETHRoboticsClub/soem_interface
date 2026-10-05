@@ -74,6 +74,12 @@ only after an acquire load observes completion. Queueing is not confirmation.
 The cyclic bus owner advances one nonblocking datagram step per update. Gain
 clients also require matching readback before declaring a pair applied.
 
+`startup()` configures the slaves on up to `BusTransport::concurrentSlaves()`
+threads. Per-slave calls (synchronous SDOs, one slave's AL wait below OP) to
+distinct slaves overlap; every other bus call stays exclusive. SOEM carries
+`EC_MAXBUF` (16) at once, one frame index per blocked call. A failed slave does
+not stop the others; the bus is mapped only when every slave started.
+
 Synchronous SDO calls are for startup/configuration outside OP and return failure
 in OP. Leaving OP cancels pending requests. An uncertain transaction after sending
 a mailbox request quarantines that slave's mailbox until the bus is recreated and initialized;

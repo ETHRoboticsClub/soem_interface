@@ -464,6 +464,11 @@ ec_adaptert* ec_find_adapters(void);
 void ec_free_adapters(ec_adaptert* adapter);
 uint8 ec_nextmbxcnt(uint8 cnt);
 void ec_clearmbx(ec_mbxbuft* Mbx);
+/* Defined where the error list is locked: on these targets mailbox transfers to
+ * distinct slaves may run on concurrent threads. */
+#if defined(__linux__) || defined(__APPLE__)
+#define EC_ERRORLIST_THREADSAFE 1
+#endif
 void ecx_pusherror(ecx_contextt* context, const ec_errort* Ec);
 boolean ecx_poperror(ecx_contextt* context, ec_errort* Ec);
 boolean ecx_iserror(ecx_contextt* context);

@@ -29,8 +29,13 @@
 // access goes through the BusTransport.
 #include <soem_rsl/ethercat.h>
 
+#include <condition_variable>
+#include <exception>
+#include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <sstream>
+#include <thread>
 
 namespace soem_interface_rsl {
 
@@ -50,7 +55,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
       MELO_WARN_STREAM("[SOEM_Interface] requesting number of slaves on not inited bus.")
       return 0;
     }
-    std::lock_guard<std::mutex> contextLock(contextMutex_);
+    std::shared_lock<std::shared_mutex> contextLock(contextMutex_);
     return transport_->slaveCount();
   }
 
@@ -83,7 +88,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     }
 
     {
-      std::lock_guard<std::mutex> contextLock(contextMutex_);
+      std::lock_guard<std::shared_mutex> contextLock(contextMutex_);
       if (!transport_->open()) {
         MELO_ERROR_STREAM("[" << name_ << "] "
                               << "No socket connection. Execute as root.");
@@ -175,18 +180,9 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     }
     if (!preflightOk) return false;
 
-    // Initialize the communication interfaces of all slaves.
-    for (auto& slave : slaves_) {
-      MELO_INFO_STREAM("[soem_interface_rsl::" << name_ << "] Starting slave: " << slave->getName())
-      if (!slave->startup()) {
-        MELO_ERROR_STREAM("[soem_interface_rsl::" << name_ << "] Slave '" << slave->getName() << "' was not initialized successfully.");
-        return false;
-      } else {
-        MELO_DEBUG_STREAM("[soem_interface_rsl::" << name_ << "] Successfully started slave: " << slave->getName())
-      }
-    }
+    if (!startSlaves(abortFlag)) return false;
 
-    std::lock_guard<std::mutex> contextLock(contextMutex_);
+    std::lock_guard<std::shared_mutex> contextLock(contextMutex_);
     // Set up the communication IO mapping.
     // Note: mapProcessImage requests the slaves to go to SAFE-OP.
     [[maybe_unused]] int ioMapSize = transport_->mapProcessImage();
@@ -235,6 +231,53 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     return true;
   }
 
+  // Configures every slave, up to the transport's concurrentSlaves() at once.
+  // A failed or throwing slave does not stop the others: each failure is
+  // reported and the bus is not mapped; the first exception is rethrown once
+  // every worker joined.
+  bool startSlaves(std::atomic<bool>& abortFlag) {
+    const std::string& name_ = getName();
+    const size_t workers =
+        std::min<size_t>(slaves_.size(), std::max(1u, transport_->concurrentSlaves()));
+    {
+      std::lock_guard<std::shared_mutex> contextLock(contextMutex_);
+      concurrentSlaves_ = workers > 1 ? workers : 0;
+    }
+    std::atomic<size_t> next{0};
+    std::vector<char> started(slaves_.size(), 0);
+    std::mutex failureMutex;
+    std::exception_ptr failure;
+    auto work = [&] {
+      for (size_t i = next++; i < slaves_.size() && !abortFlag; i = next++) {
+        auto& slave = slaves_[i];
+        MELO_INFO_STREAM("[soem_interface_rsl::" << name_ << "] Starting slave: " << slave->getName())
+        try {
+          started[i] = slave->startup();
+        } catch (...) {
+          std::lock_guard<std::mutex> lock(failureMutex);
+          if (!failure) failure = std::current_exception();
+        }
+        if (!started[i])
+          MELO_ERROR_STREAM("[soem_interface_rsl::" << name_ << "] Slave '" << slave->getName()
+                            << "' was not initialized successfully.");
+      }
+    };
+    std::vector<std::thread> pool;
+    for (size_t w = 1; w < workers; ++w) pool.emplace_back(work);
+    work();
+    for (auto& thread : pool) thread.join();
+    {
+      std::lock_guard<std::shared_mutex> contextLock(contextMutex_);
+      concurrentSlaves_ = 0;
+    }
+    if (failure) std::rethrow_exception(failure);
+    if (abortFlag) {
+      MELO_WARN_STREAM("[soem_interface_rsl::" << name_ << "] Shutdown during slave startup.");
+      return false;
+    }
+    return std::all_of(started.begin(), started.end(), [](char ok) { return ok != 0; });
+  }
+
   std::optional<EthercatBusBase::StartupSlaveCountMismatch> getStartupSlaveCountMismatch() const {
     return startupSlaveCountMismatch_;
   }
@@ -248,7 +291,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     //! Receive the EtherCAT data.
     updateReadStamp_ = std::chrono::high_resolution_clock::now();
     {
-      std::lock_guard<std::mutex> guard(contextMutex_);
+      std::lock_guard<std::shared_mutex> guard(contextMutex_);
       wkc_ = transport_->receiveProcessData(std::chrono::microseconds(EC_TIMEOUTRET));
     }
     sentProcessData_ = false;
@@ -292,7 +335,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
     //! Send the EtherCAT data.
     updateWriteStamp_ = std::chrono::high_resolution_clock::now();
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     transport_->sendProcessData();
     sentProcessData_ = true;
   }
@@ -304,7 +347,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   void shutdown() {
     if (initlialized_) {
       {
-        std::lock_guard<std::mutex> guard(contextMutex_);
+        std::lock_guard<std::shared_mutex> guard(contextMutex_);
         // Set the slaves to state Init; a slave off the bus cannot hold this up.
         if (transport_->slaveCount() > 0) setStateSkippingSilentLocked(EC_STATE_INIT);
       }  // release the contextMutex_ in case slave wants to do low_level commands at shutdown.
@@ -314,7 +357,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     }
 
     // Close the port.
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     MELO_INFO_STREAM("[soem_interface_rsl::" << getName() << "] Closing socket ...");
     transport_->close();
     // Sleep to make sure the socket is closed, because ecx_close is non-blocking.
@@ -323,17 +366,20 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   }
 
   bool setStateSkippingSilent(const uint16_t state) {
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     return setStateSkippingSilentLocked(state);
   }
 
   void setState(const uint16_t state, const uint16_t slave = 0) {
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     setStateLocked(state, slave);
   }
 
   bool waitForState(const uint16_t state, const uint16_t slave = 0, const unsigned int maxRetries = 20) {
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    // OP exchanges process data; slave 0 reads the whole segment.
+    if (slave != 0 && state != EC_STATE_OPERATIONAL)
+      return withSlave(slave, [&] { return waitForStateLocked(state, slave, maxRetries); });
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     return waitForStateLocked(state, slave, maxRetries);
   }
 
@@ -369,7 +415,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   }
 
   void serviceMailbox() {
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     if (!cyclicActive_) return;
     mailbox_.tick();
     if (diagnosticRequest_) {
@@ -433,7 +479,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   }
   int getWorkingCounter() const { return wkc_.load(); }
   bool cyclicActive() {
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     return cyclicActive_;
   }
 
@@ -461,7 +507,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
       int lowestSlaveState = getState(0);  // one datagram iff all slaves in the same state, otherwise one datagram per slave.
 
-      std::lock_guard<std::mutex> guard(contextMutex_);
+      std::lock_guard<std::shared_mutex> guard(contextMutex_);
       if ((lowestSlaveState & 0x0f) < EC_STATE_OPERATIONAL) {  // if ECAT Error bus state is e.g. 0x14 = 0x10 (error) + 0x04 (safeOP)
         MELO_WARN_STREAM("[EthercatBus::BusMonitoring::" << name_ << "] No all slaves in EC_STATE_OPERATIONAL")
         for (const auto& slave : slaves_) {
@@ -502,7 +548,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
       // slaves.
       std::byte rawData[REG::ERROR_COUNTERS_LIST.memorySize()];
       memset(rawData, 0xbe, REG::ERROR_COUNTERS_LIST.memorySize());
-      std::lock_guard<std::mutex> guard(contextMutex_);
+      std::lock_guard<std::shared_mutex> guard(contextMutex_);
       if (transport_->readRegister(static_cast<uint16_t>(selectedSlave->getAddress()),
                                    static_cast<uint16_t>(REG::ERROR_COUNTERS::FRAME_ERROR_PORT0_ADDR),
                                    REG::ERROR_COUNTERS_LIST.memorySize(), rawData, std::chrono::microseconds(EC_TIMEOUTRET3))) {
@@ -533,7 +579,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   }
 
   bool getBusDiagnosisLog(BusDiagnosisLog& busDiagnosisLogOut) {
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     if (busDiagnosisLog_.fullyUpdated) {
       busDiagnosisLogOut = busDiagnosisLog_;
       busDiagnosisLog_.fullyUpdated = false;
@@ -555,7 +601,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   }
 
   EthercatBusBase::PdoSizePair getHardwarePdoSizes(const uint16_t slave) {
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::shared_lock<std::shared_mutex> guard(contextMutex_);
     return std::make_pair(transport_->outputs(slave).size, transport_->inputs(slave).size);
   }
 
@@ -596,13 +642,13 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   }
 
   bool sdoWrite(const uint16_t slave, const uint16_t index, const uint8_t subindex, const bool completeAccess, int size, void* buf) {
-    int wkc = 0;
-    {
-      if (!slaveOnBus(slave, __func__)) return false;
-      std::lock_guard<std::mutex> guard(contextMutex_);
-      if (cyclicActive_) return false; // Runtime callers must use requestSdo().
-      wkc = transport_->sdoWrite(slave, index, subindex, completeAccess, size, buf, std::chrono::microseconds(EC_TIMEOUTRXM));
-    }
+    if (!slaveOnBus(slave, __func__)) return false;
+    const auto transferred = withSlave(slave, [&]() -> std::optional<int> {
+      if (cyclicActive_) return std::nullopt; // Runtime callers must use requestSdo().
+      return transport_->sdoWrite(slave, index, subindex, completeAccess, size, buf, std::chrono::microseconds(EC_TIMEOUTRXM));
+    });
+    if (!transferred) return false;
+    const int wkc = *transferred;
     if (wkc <= 0) {
       logSdoFailure(slave, index, subindex, wkc, "writing");
       return false;
@@ -612,13 +658,13 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
   bool sdoRead(const uint16_t slave, const uint16_t index, const uint8_t subindex, const bool completeAccess, int size, void* buf) {
     int requestedSize = size;
-    int wkc = 0;
-    {
-      if (!slaveOnBus(slave, __func__)) return false;
-      std::lock_guard<std::mutex> guard(contextMutex_);
-      if (cyclicActive_) return false; // Runtime callers must use requestSdo().
-      wkc = transport_->sdoRead(slave, index, subindex, completeAccess, size, buf, std::chrono::microseconds(EC_TIMEOUTRXM));
-    }
+    if (!slaveOnBus(slave, __func__)) return false;
+    const auto transferred = withSlave(slave, [&]() -> std::optional<int> {
+      if (cyclicActive_) return std::nullopt; // Runtime callers must use requestSdo().
+      return transport_->sdoRead(slave, index, subindex, completeAccess, size, buf, std::chrono::microseconds(EC_TIMEOUTRXM));
+    });
+    if (!transferred) return false;
+    const int wkc = *transferred;
     if (wkc <= 0) {
       logSdoFailure(slave, index, subindex, wkc, "reading");
       return false;
@@ -633,13 +679,13 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   }
 
   int sdoReadSize(const uint16_t slave, const uint16_t index, const uint8_t subindex, const bool completeAccess, int size, void* buf) {
-    int wkc = 0;
-    {
-      if (!slaveOnBus(slave, __func__)) return 0;
-      std::lock_guard<std::mutex> guard(contextMutex_);
-      if (cyclicActive_) return 0; // Runtime callers must use requestSdo().
-      wkc = transport_->sdoRead(slave, index, subindex, completeAccess, size, buf, std::chrono::microseconds(EC_TIMEOUTRXM));
-    }
+    if (!slaveOnBus(slave, __func__)) return 0;
+    const auto transferred = withSlave(slave, [&]() -> std::optional<int> {
+      if (cyclicActive_) return std::nullopt; // Runtime callers must use requestSdo().
+      return transport_->sdoRead(slave, index, subindex, completeAccess, size, buf, std::chrono::microseconds(EC_TIMEOUTRXM));
+    });
+    if (!transferred) return 0;
+    const int wkc = *transferred;
     if (wkc <= 0) {
       logSdoFailure(slave, index, subindex, wkc, "reading");
       return 0;
@@ -649,7 +695,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
   void readTxPdo(const uint16_t slave, int size, void* buf) const {
     assert(static_cast<int>(slave) <= transport_->slaveCount());
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     const auto in = transport_->inputs(slave);
     assert(size == (int)in.size);
     memcpy(buf, in.data, size);
@@ -657,15 +703,43 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
   void writeRxPdo(const uint16_t slave, int size, const void* buf) {
     assert(static_cast<int>(slave) <= transport_->slaveCount());
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     const auto out = transport_->outputs(slave);
     assert((int)out.size == size);
     memcpy(out.data, buf, size);
   }
 
  private:
+  // Runs one slave's access. During startSlaves() accesses to distinct slaves
+  // share the context, at most concurrentSlaves_ at once, each holding its
+  // slave's lock; otherwise the access holds the context exclusively.
+  template <typename Access>
+  auto withSlave(const uint16_t slave, Access&& access) -> decltype(access()) {
+    std::shared_lock<std::shared_mutex> shared(contextMutex_);
+    if (concurrentSlaves_ > 0 && slave < slaveMutex_.size()) {
+      std::unique_lock<std::mutex> gate(gateMutex_);
+      gateFree_.wait(gate, [&] { return inFlight_ < concurrentSlaves_; });
+      ++inFlight_;
+      gate.unlock();
+      struct Release {
+        std::mutex& mutex;
+        size_t& inFlight;
+        std::condition_variable& freed;
+        ~Release() {
+          { std::lock_guard<std::mutex> gate(mutex); --inFlight; }
+          freed.notify_one();
+        }
+      } release{gateMutex_, inFlight_, gateFree_};
+      std::lock_guard<std::mutex> own(slaveMutex_[slave]);
+      return access();
+    }
+    shared.unlock();
+    std::lock_guard<std::shared_mutex> exclusive(contextMutex_);
+    return access();
+  }
+
   uint16_t getState(const uint16_t slave) {
-    std::lock_guard<std::mutex> guard(contextMutex_);
+    std::lock_guard<std::shared_mutex> guard(contextMutex_);
     int lowest_state = EC_STATE_OPERATIONAL;
     if (cyclicActive_) {
       for (int i = 1; i <= transport_->slaveCount(); ++i) {
@@ -854,6 +928,7 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
    * @return True if an error for the index exists.
    */
   bool checkForSdoErrors(const uint16_t slave, const uint16_t index) {
+    std::lock_guard<std::mutex> lock(errorMutex_);
     TransportError error;
     while (transport_->popError(error)) {
       std::string errorStr = getErrorString(error);
@@ -905,9 +980,15 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   size_t busDiagOfCurrentSlave_{0};  // running variable to send only one frame per slave.
   std::set<uint16_t> lostLogged_;    // slaves already reported lost by the non-cyclic monitoring.
 
-  mutable std::mutex contextMutex_;
+  mutable std::shared_mutex contextMutex_;
 
   bool cyclicActive_{false}; // protected by contextMutex_
+  size_t concurrentSlaves_{0}; // protected by contextMutex_; 0 outside startSlaves()
+  std::mutex gateMutex_;
+  std::condition_variable gateFree_;
+  size_t inFlight_{0}; // protected by gateMutex_
+  std::array<std::mutex, EC_MAXSLAVE> slaveMutex_;
+  std::mutex errorMutex_;
   bool diagnosticSweep_{false}, diagnosticCounters_{false};
   static constexpr uint32_t kUnobservedAL = 0xffffffff;
   std::array<std::atomic<uint32_t>, EC_MAXSLAVE> observedAL_{};

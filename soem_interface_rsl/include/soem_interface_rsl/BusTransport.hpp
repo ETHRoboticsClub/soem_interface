@@ -44,13 +44,20 @@ struct TransportError {
 // registry, callback order, the WKC gate, sync/cyclic ownership and the AL
 // observation cache; an adapter must not reimplement any of those.
 //
-// Calls are serialized by the core (it holds its context lock); an adapter
-// needs no locking of its own. `sendProcessData`/`receiveProcessData` and the
-// mailbox transport run on the cyclic path and must not allocate or block
-// beyond the stated timeout.
+// Calls are serialized by the core (it holds its context lock), with one
+// exception: while the core starts its slaves, the per-slave calls (`sdoWrite`,
+// `sdoRead`, and `awaitAlState` for one slave below OP) may run for up to
+// `concurrentSlaves()` distinct slaves at once, never twice for the same slave,
+// and `popError` may run alongside them. `sendProcessData`/`receiveProcessData`
+// and the mailbox transport run on the cyclic path and must not allocate or
+// block beyond the stated timeout.
 class BusTransport {
 public:
   virtual ~BusTransport() = default;
+
+  // How many slaves' per-slave calls the adapter carries at once; 1 serializes
+  // them.
+  virtual unsigned concurrentSlaves() const { return 1; }
 
   virtual const std::string& name() const = 0;
   // The segment can be opened: the NIC exists, or the fake session endpoint answers.
