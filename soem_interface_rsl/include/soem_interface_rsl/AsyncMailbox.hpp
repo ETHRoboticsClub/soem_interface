@@ -60,7 +60,8 @@ class MailboxTransport {
 };
 
 // Expedited CoE only (1..4-byte objects); segmented/complete-access startup
-// configuration remains synchronous outside OP. One network poll per tick.
+// configuration remains synchronous outside OP. Per tick at most one network
+// poll and one datagram start.
 class AsyncMailbox {
  public:
   using Clock = std::chrono::steady_clock;
@@ -101,6 +102,33 @@ class AsyncMailbox {
     // Producers cannot make the cyclic owner wait for the queue lock.
     std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
     if (!lock || !enabled_) return;
+    if (inFlight_) {
+      if (now - started_ >= kTimeout) { finish(MailboxStatus::Timeout, sentMailbox_); return; }
+      const int result = transport_.poll(buffer_.data());
+      if (result < 0) return;
+      inFlight_ = false;
+      if (phase_ == Phase::Count) {
+        active_->value = static_cast<uint32_t>(result);
+        finish(MailboxStatus::Success);
+      } else if (result != 1) {
+        finish(MailboxStatus::TransportError, sentMailbox_);
+      } else {
+        switch (phase_) {
+          case Phase::DrainStatus: phase_ = (buffer_[0] & 8) ? Phase::Drain : Phase::SendStatus; break;
+          case Phase::Drain: phase_ = Phase::DrainStatus; break;
+          case Phase::SendStatus: if (!(buffer_[0] & 8)) phase_ = Phase::Send; break;
+          case Phase::Send: phase_ = Phase::ReceiveStatus; break;
+          case Phase::ReceiveStatus: if (buffer_[0] & 8) phase_ = Phase::Receive; break;
+          case Phase::Receive: consume(); break;
+          case Phase::Register:
+            std::copy_n(buffer_.begin(), active_->size, active_->registers.begin());
+            finish(MailboxStatus::Success); break;
+          case Phase::Count: break;
+        }
+      }
+      // The reply freed the wire, so the next datagram goes out this tick: one
+      // round trip per cyclic update, still never two datagrams in flight.
+    }
     if (!active_) {
       if (queue_.empty()) return;
       active_ = queue_.front().request;
@@ -119,26 +147,6 @@ class AsyncMailbox {
       }
     }
     if (now - started_ >= kTimeout) { finish(MailboxStatus::Timeout, sentMailbox_); return; }
-    if (inFlight_) {
-      const int result = transport_.poll(buffer_.data());
-      if (result < 0) return;
-      inFlight_ = false;
-      if (phase_ == Phase::Count) { active_->value = static_cast<uint32_t>(result); finish(MailboxStatus::Success); return; }
-      if (result != 1) { finish(MailboxStatus::TransportError, sentMailbox_); return; }
-      switch (phase_) {
-        case Phase::DrainStatus: phase_ = (buffer_[0] & 8) ? Phase::Drain : Phase::SendStatus; break;
-        case Phase::Drain: phase_ = Phase::DrainStatus; break;
-        case Phase::SendStatus: if (!(buffer_[0] & 8)) phase_ = Phase::Send; break;
-        case Phase::Send: phase_ = Phase::ReceiveStatus; break;
-        case Phase::ReceiveStatus: if (buffer_[0] & 8) phase_ = Phase::Receive; break;
-        case Phase::Receive: consume(); break;
-        case Phase::Register:
-          std::copy_n(buffer_.begin(), active_->size, active_->registers.begin());
-          finish(MailboxStatus::Success); break;
-        case Phase::Count: break;
-      }
-      return; // At most one completion or submission per tick.
-    }
     if (phase_ == Phase::Count) {
       inFlight_ = transport_.startCount(active_->index);
       if (!inFlight_) finish(MailboxStatus::TransportError);

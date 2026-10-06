@@ -71,7 +71,9 @@ Tests will be conducted as soon as possible.
 `EthercatBusBase::requestSdo` queues expedited CoE reads/writes (1–4 bytes,
 no complete access). Poll the returned `MailboxRequest::status`; read its result
 only after an acquire load observes completion. Queueing is not confirmation.
-The cyclic bus owner advances one nonblocking datagram step per update. Gain
+The cyclic bus owner advances the transaction by one nonblocking datagram round
+trip per update: it collects the previous datagram's reply and sends the next
+one, so an expedited SDO takes about five updates plus the slave's reply time. Gain
 clients also require matching readback before declaring a pair applied.
 
 Synchronous SDO calls are for startup/configuration outside OP and return failure

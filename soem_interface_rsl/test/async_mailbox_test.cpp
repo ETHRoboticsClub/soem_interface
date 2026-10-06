@@ -56,8 +56,8 @@ struct Wire : MailboxTransport {
 };
 void drive(AsyncMailbox& box, Wire& wire, MailboxRequest::Ptr request){
   for(int i=0;i<200 && request->status==MailboxStatus::Pending;++i){
-    int calls=wire.polls+wire.submissions;box.tick();
-    assert(wire.polls+wire.submissions-calls<=1);
+    int polls=wire.polls,submissions=wire.submissions;box.tick();
+    assert(wire.polls-polls<=1 && wire.submissions-submissions<=1);
   }
   assert(request->status!=MailboxStatus::Pending);
 }
@@ -68,6 +68,22 @@ int main(){
   drive(box,wire,write);assert(write->status==MailboxStatus::Success);
   auto read=box.submit(MailboxRequest::Kind::Read,1,0x34c6,1,4);
   wire.unrelated=true;drive(box,wire,read);assert(read->status==MailboxStatus::Success && read->value==0x12345678);
+  // An expedited SDO is five datagrams (SM1 drain check, SM0 check, request,
+  // SM1 reply check, reply); a slave that answers at once costs one cyclic
+  // update per datagram, and a queued transaction starts in the update the
+  // previous one completes.
+  {
+    const int polls=wire.polls,submissions=wire.submissions;
+    auto first=box.submit(MailboxRequest::Kind::Read,1,0x34c6,1,4);
+    auto second=box.submit(MailboxRequest::Kind::Read,2,0x34c6,1,4);
+    for(int i=0;i<5;++i){box.tick();assert(first->status==MailboxStatus::Pending);}
+    box.tick();
+    assert(first->status==MailboxStatus::Success && first->value==0x12345678);
+    assert(wire.polls-polls==5 && wire.submissions-submissions==6 && wire.flight);
+    for(int i=0;i<4;++i){box.tick();assert(second->status==MailboxStatus::Pending);}
+    box.tick();
+    assert(second->status==MailboxStatus::Success && !wire.flight);
+  }
   wire.objects[{0x603f,0}]=0x8611;
   auto fault=box.submit(MailboxRequest::Kind::Read,2,0x603f,0,2);
   drive(box,wire,fault);assert(fault->status==MailboxStatus::Success && fault->value==0x8611);
