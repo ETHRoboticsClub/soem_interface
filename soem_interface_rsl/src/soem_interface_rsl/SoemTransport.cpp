@@ -36,14 +36,26 @@ public:
     }
     return true;
   }
+  bool startCount(uint16_t reg) override {
+    index_ = ecx_getindex(context_.port);
+    size_ = 0;
+    uint16_t scratch = 0;
+    ecx_setupdatagram(context_.port, &context_.port->txbuf[index_], EC_CMD_BRD, index_, 0, reg,
+                      sizeof(scratch), &scratch);
+    if (ecx_outframe(context_.port, index_, 0) <= 0) {
+      cancel();
+      return false;
+    }
+    return true;
+  }
   int poll(uint8_t* data) override {
     const int wkc = ecx_inframe(context_.port, index_, 0);
     if (wkc < 0)
       return -1;
-    if (wkc == 1)
+    if (wkc == 1 && size_ > 0)
       std::memcpy(data, &context_.port->rxbuf[index_][EC_HEADERSIZE], size_);
     cancel();
-    return wkc == 1 ? 1 : 0;
+    return wkc;
   }
   void cancel() override {
     if (index_ >= 0)
@@ -90,6 +102,11 @@ public:
   }
 
   int detectSlaves() override { return ecx_detect_slaves(&context_); }
+  int countSlaves() override {
+    uint16_t type = 0;
+    const int wkc = ecx_BRD(context_.port, 0x0000, ECT_REG_TYPE, sizeof(type), &type, EC_TIMEOUTSAFE);
+    return wkc < 0 ? 0 : wkc;
+  }
   int enumerate() override {
     const int count = ecx_config_init(&context_, FALSE);
     // Disable symmetrical transfers.

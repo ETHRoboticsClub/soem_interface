@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <deque>
 #include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,26 +29,41 @@ struct Log {
 struct ScriptedMailbox final : MailboxTransport {
   explicit ScriptedMailbox(Log& log) : log(log) {}
   Log& log;
-  bool flight{false}, frozen{false};
-  uint16_t reg{0}, size{0};
+  bool flight{false}, frozen{false}, counting{false};
+  uint16_t reg{0}, size{0}, slave{0};
   uint8_t count{0};
   std::array<uint8_t, 32> registerReply{};
+  std::set<uint16_t> silent; // stations that answer no addressed datagram
+  int answering{0};          // slaves answering a broadcast
   MailboxEndpoint endpoint(uint16_t) const override { return {0x1000, 128, 0x1100, 128}; }
   uint8_t nextCounter(uint16_t) override {
     count = count % 7 + 1;
     return count;
   }
-  bool start(uint16_t slave, uint16_t r, bool, const uint8_t*, uint16_t n) override {
+  bool start(uint16_t s, uint16_t r, bool, const uint8_t*, uint16_t n) override {
     flight = true;
+    slave = s;
     reg = r;
     size = n;
-    log.add("mbx:start:" + std::to_string(slave) + ":" + std::to_string(r));
+    log.add("mbx:start:" + std::to_string(s) + ":" + std::to_string(r));
+    return true;
+  }
+  bool startCount(uint16_t r) override {
+    flight = counting = true;
+    reg = r;
+    log.add("mbx:count");
     return true;
   }
   int poll(uint8_t* data) override {
     if (frozen)
       return -1;
     flight = false;
+    if (counting) {
+      counting = false;
+      return answering;
+    }
+    if (silent.count(slave))
+      return 0;
     std::copy_n(registerReply.begin(), size, data);
     return 1;
   }
@@ -87,6 +103,10 @@ struct ScriptedTransport final : BusTransport {
   }
   int detectSlaves() override {
     log_.add("detect");
+    return detected_ < 0 ? count_ : detected_;
+  }
+  int countSlaves() override {
+    log_.add("count");
     return detected_ < 0 ? count_ : detected_;
   }
   int enumerate() override {
@@ -434,6 +454,164 @@ TEST(BusCore, LeavingOpForgetsObservationsAndSilentSlaveIsObservedOffTheBus) {
   f.bus->setState(ETHERCAT_SM_STATE::SAFE_OP);
   EXPECT_FALSE(f.bus->getSlaveALStatus(1).observed)
       << "a state request invalidates every observation";
+}
+
+// Cycles the bus until `done` holds; the count and the degraded sweep run on
+// wall-clock periods.
+template <class Done>
+bool cycleUntil(Fixture& f, Done done, std::chrono::milliseconds limit) {
+  const auto deadline = std::chrono::steady_clock::now() + limit;
+  while (std::chrono::steady_clock::now() < deadline) {
+    f.bus->updateWrite();
+    f.bus->updateRead();
+    if (done())
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  return false;
+}
+
+constexpr auto kCountWait = 3 * EthercatBusBase::kSlaveCountPeriod;
+
+TEST(BusCore, BroadcastCountReportsSlavesBeyondTheConfiguredOnes) {
+  Fixture f;
+  ASSERT_TRUE(f.startup());
+  f.activate();
+  EXPECT_FALSE(f.bus->getUnconfiguredResponders().has_value()) << "no count before the first";
+  f.transport->mailbox_.answering = 3; // a slave absent at startup was powered on
+  auto unconfigured = [&](int n) {
+    return [&f, n] { return f.bus->getUnconfiguredResponders() == std::optional<int>(n); };
+  };
+  ASSERT_TRUE(cycleUntil(f, unconfigured(1), kCountWait));
+  EXPECT_TRUE(f.bus->busIsOk()) << "an unmapped slave does not lower the working counter";
+  f.transport->mailbox_.answering = 2;
+  EXPECT_TRUE(cycleUntil(f, unconfigured(0), kCountWait));
+}
+
+TEST(BusCore, RebootedSlaveIsUnconfiguredOnceItsStationAddressIsSilent) {
+  Fixture f;
+  ASSERT_TRUE(f.startup());
+  f.activate();
+  // Slave 2 rebooted: it answers a broadcast, but no longer at its station
+  // address, and it exchanges no process data.
+  f.transport->mailbox_.registerReply = {kOp, 0, 0, 0, 0, 0};
+  f.transport->mailbox_.silent = {2};
+  f.transport->mailbox_.answering = 2;
+  f.transport->wkc_ = f.transport->expectedWorkingCounter() - 3;
+  ASSERT_TRUE(cycleUntil(
+      f, [&] { return f.bus->getUnconfiguredResponders() == std::optional<int>(1); }, kCountWait));
+  EXPECT_EQ(f.bus->getSlaveALStatus(2).state, kNone);
+  EXPECT_NE(f.bus->getSlaveALStatus(1).state, kNone);
+}
+
+TEST(BusCore, UnpoweredSlaveIsNotUnconfigured) {
+  Fixture f;
+  ASSERT_TRUE(f.startup());
+  f.activate();
+  f.transport->mailbox_.registerReply = {kOp, 0, 0, 0, 0, 0};
+  f.transport->mailbox_.silent = {2};
+  f.transport->mailbox_.answering = 1; // slave 2 answers nothing at all
+  f.transport->wkc_ = f.transport->expectedWorkingCounter() - 3;
+  ASSERT_TRUE(cycleUntil(f, [&] { return f.bus->getSlaveALStatus(2).observed; }, kCountWait));
+  ASSERT_TRUE(cycleUntil(
+      f, [&] { return f.bus->getUnconfiguredResponders().has_value(); }, kCountWait));
+  EXPECT_EQ(*f.bus->getUnconfiguredResponders(), 0);
+}
+
+TEST(BusCore, AlSweepRepeatsWhileTheWorkingCounterStaysLow) {
+  Fixture f;
+  ASSERT_TRUE(f.startup());
+  f.activate();
+  f.transport->wkc_ = f.transport->expectedWorkingCounter() - 1;
+  f.log.events.clear();
+  const std::string sweepOfSlave1 = "mbx:start:1:" + std::to_string(0x0130);
+  ASSERT_TRUE(cycleUntil(
+      f,
+      [&] { return std::count(f.log.events.begin(), f.log.events.end(), sweepOfSlave1) >= 3; },
+      6 * EthercatBusBase::kDegradedSweepPeriod))
+      << "a slave that leaves or returns after the first low cycle must still be observed";
+}
+
+TEST(BusCore, CountWithoutAnAnswerIsNoObservation) {
+  Fixture f;
+  ASSERT_TRUE(f.startup());
+  f.activate();
+  f.transport->mailbox_.answering = 3;
+  ASSERT_TRUE(cycleUntil(
+      f, [&] { return f.bus->getUnconfiguredResponders().has_value(); }, kCountWait));
+  f.transport->mailbox_.frozen = true; // the link carries no frame back
+  EXPECT_TRUE(cycleUntil(
+      f, [&] { return !f.bus->getUnconfiguredResponders().has_value(); },
+      kCountWait + std::chrono::duration_cast<std::chrono::milliseconds>(AsyncMailbox::kTimeout)))
+      << "a stale count must not stay current";
+}
+
+TEST(BusCore, ASilentSlaveWithholdsOnlyItsOwnFeedback) {
+  Fixture f;
+  ASSERT_TRUE(f.startup());
+  f.activate();
+  f.transport->mailbox_.registerReply = {kOp, 0, 0, 0, 0, 0};
+  f.transport->mailbox_.silent = {2};
+  // Slave 2 contributes nothing; slave 1 its full 3.
+  f.transport->wkc_ = f.transport->expectedWorkingCounter() - 3;
+  ASSERT_TRUE(cycleUntil(f, [&] { return f.bus->getSlaveALStatus(2).state == kNone &&
+                                         f.bus->getSlaveALStatus(1).observed; }, kCountWait));
+  f.log.events.clear();
+  f.bus->updateWrite();
+  f.bus->updateRead();
+  EXPECT_EQ(std::count(f.log.events.begin(), f.log.events.end(), "slave.read:s1"), 1);
+  EXPECT_EQ(std::count(f.log.events.begin(), f.log.events.end(), "slave.read:s2"), 0);
+}
+
+TEST(BusCore, AShortfallTheSweepCannotExplainWithholdsEveryone) {
+  Fixture f;
+  ASSERT_TRUE(f.startup());
+  f.activate();
+  f.transport->mailbox_.registerReply = {kOp, 0, 0, 0, 0, 0};
+  f.transport->mailbox_.silent = {2};
+  // Slave 2 is seen silent, but slave 1 also lost a datagram: 3 != 2.
+  f.transport->wkc_ = f.transport->expectedWorkingCounter() - 4;
+  ASSERT_TRUE(cycleUntil(f, [&] { return f.bus->getSlaveALStatus(2).state == kNone; }, kCountWait));
+  f.log.events.clear();
+  for (int i = 0; i < 5; ++i) {
+    f.bus->updateWrite();
+    f.bus->updateRead();
+  }
+  EXPECT_EQ(std::count_if(f.log.events.begin(), f.log.events.end(),
+                          [](const std::string& e) { return e.rfind("slave.read", 0) == 0; }),
+            0);
+}
+
+TEST(BusCore, AFullExchangeOverridesAStaleSilentObservation) {
+  Fixture f;
+  ASSERT_TRUE(f.startup());
+  f.activate();
+  f.transport->mailbox_.registerReply = {kOp, 0, 0, 0, 0, 0};
+  f.transport->mailbox_.silent = {2};
+  f.transport->mailbox_.answering = 2;
+  f.transport->wkc_ = f.transport->expectedWorkingCounter() - 3;
+  ASSERT_TRUE(cycleUntil(f, [&] { return f.bus->getSlaveALStatus(2).state == kNone; }, kCountWait));
+  // The read was lost; slave 2 exchanges again and the sweep stops.
+  f.transport->mailbox_.silent.clear();
+  f.transport->wkc_ = f.transport->expectedWorkingCounter();
+  EXPECT_TRUE(cycleUntil(
+      f, [&] { return f.bus->getUnconfiguredResponders() == std::optional<int>(0); }, kCountWait))
+      << "a stale silent record must not read as a returned drive";
+  EXPECT_EQ(f.bus->getRespondingSlaves(), std::optional<int>(2));
+}
+
+TEST(BusCore, SlaveCountProbeOpensOnlyAStoppedBus) {
+  Fixture f;
+  f.transport->detected_ = 3;
+  EXPECT_EQ(f.bus->probeSlaveCount(), 3);
+  EXPECT_EQ(f.log.events, (std::vector<std::string>{"open", "count", "close"}))
+      << "a probe never resets the slaves' AL state the operator diagnoses from";
+  EXPECT_FALSE(f.transport->open_);
+  f.transport->detected_ = -1;
+  ASSERT_TRUE(f.startup());
+  f.log.events.clear();
+  EXPECT_EQ(f.bus->probeSlaveCount(), -1);
+  EXPECT_TRUE(f.log.events.empty()) << "a started bus is never reopened";
 }
 
 TEST(BusCore, ShutdownRequestsInitBeforeSlaveShutdownAndClosesLast) {

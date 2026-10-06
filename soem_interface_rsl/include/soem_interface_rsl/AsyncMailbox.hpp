@@ -28,7 +28,9 @@ inline const char* mailboxStatusName(MailboxStatus status) {
 }
 struct MailboxRequest {
   using Ptr = std::shared_ptr<MailboxRequest>;
-  enum class Kind { Read, Write, Register };
+  // Count: a broadcast read whose working counter, in `value`, is the number of
+  // slaves that answered; `slave` is 0.
+  enum class Kind { Read, Write, Register, Count };
   const Kind kind;
   const uint16_t slave, index;
   const uint8_t subindex, size;
@@ -49,7 +51,10 @@ class MailboxTransport {
   virtual MailboxEndpoint endpoint(uint16_t slave) const = 0;
   virtual uint8_t nextCounter(uint16_t slave) = 0;
   virtual bool start(uint16_t slave, uint16_t reg, bool write, const uint8_t* data, uint16_t size) = 0;
-  // -1 pending, 0 unsuccessful WKC, 1 complete. Copies exactly the requested size.
+  // Broadcast read (BRD) of one ESC register; nothing is copied back.
+  virtual bool startCount(uint16_t reg) = 0;
+  // -1 pending, otherwise the datagram's WKC. Copies exactly the requested size
+  // when the WKC is 1.
   virtual int poll(uint8_t* data) = 0;
   virtual void cancel() = 0;
 };
@@ -81,9 +86,10 @@ class AsyncMailbox {
                              uint8_t sub, uint8_t size, uint32_t value = 0) {
     auto request = std::make_shared<MailboxRequest>(kind, slave, index, sub, size, value);
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!enabled_ || slave == 0 || slave >= poisoned_.size() || (kind != MailboxRequest::Kind::Register && poisoned_[slave]) || queue_.size() >= kQueueCapacity) {
+    const bool count = kind == MailboxRequest::Kind::Count;
+    if (!enabled_ || (slave == 0) != count || slave >= poisoned_.size() || (isCoe(kind) && poisoned_[slave]) || queue_.size() >= kQueueCapacity) {
       request->status = MailboxStatus::Unavailable;
-    } else if (size == 0 || size > (kind == MailboxRequest::Kind::Register ? 32 : 4)) {
+    } else if (size == 0 || size > (isCoe(kind) ? 4 : 32)) {
       request->status = MailboxStatus::Invalid;
     } else {
       queue_.push_back({request, Clock::now()});
@@ -100,10 +106,14 @@ class AsyncMailbox {
       active_ = queue_.front().request;
       started_ = queue_.front().queued;
       queue_.pop_front();
-      if (active_->kind != MailboxRequest::Kind::Register && poisoned_[active_->slave]) { finish(MailboxStatus::Unavailable); return; }
-      endpoint_ = transport_.endpoint(active_->slave);
-      phase_ = active_->kind == MailboxRequest::Kind::Register ? Phase::Register : Phase::DrainStatus;
-      if (phase_ != Phase::Register && (endpoint_.writeSize < 16 || endpoint_.readSize < 16 ||
+      if (isCoe(active_->kind) && poisoned_[active_->slave]) { finish(MailboxStatus::Unavailable); return; }
+      if (active_->kind == MailboxRequest::Kind::Count) {
+        phase_ = Phase::Count;
+      } else {
+        endpoint_ = transport_.endpoint(active_->slave);
+        phase_ = active_->kind == MailboxRequest::Kind::Register ? Phase::Register : Phase::DrainStatus;
+      }
+      if (isCoe(active_->kind) && (endpoint_.writeSize < 16 || endpoint_.readSize < 16 ||
           endpoint_.writeSize > buffer_.size() || endpoint_.readSize > buffer_.size())) {
         finish(MailboxStatus::Invalid); return;
       }
@@ -113,7 +123,8 @@ class AsyncMailbox {
       const int result = transport_.poll(buffer_.data());
       if (result < 0) return;
       inFlight_ = false;
-      if (result == 0) { finish(MailboxStatus::TransportError, sentMailbox_); return; }
+      if (phase_ == Phase::Count) { active_->value = static_cast<uint32_t>(result); finish(MailboxStatus::Success); return; }
+      if (result != 1) { finish(MailboxStatus::TransportError, sentMailbox_); return; }
       switch (phase_) {
         case Phase::DrainStatus: phase_ = (buffer_[0] & 8) ? Phase::Drain : Phase::SendStatus; break;
         case Phase::Drain: phase_ = Phase::DrainStatus; break;
@@ -124,8 +135,14 @@ class AsyncMailbox {
         case Phase::Register:
           std::copy_n(buffer_.begin(), active_->size, active_->registers.begin());
           finish(MailboxStatus::Success); break;
+        case Phase::Count: break;
       }
       return; // At most one completion or submission per tick.
+    }
+    if (phase_ == Phase::Count) {
+      inFlight_ = transport_.startCount(active_->index);
+      if (!inFlight_) finish(MailboxStatus::TransportError);
+      return;
     }
     buffer_.fill(0);
     uint16_t reg = 0, size = 1;
@@ -143,6 +160,7 @@ class AsyncMailbox {
         for (unsigned i = 0; i < active_->size; ++i) buffer_[12 + i] = active_->writeValue >> (8 * i);
         break;
       case Phase::Register: reg = active_->index; size = active_->size; break;
+      case Phase::Count: break;
     }
     inFlight_ = transport_.start(active_->slave, reg, write, buffer_.data(), size);
     if (inFlight_ && phase_ == Phase::Send) sentMailbox_ = true;
@@ -150,7 +168,10 @@ class AsyncMailbox {
   }
 
  private:
-  enum class Phase { DrainStatus, Drain, SendStatus, Send, ReceiveStatus, Receive, Register };
+  enum class Phase { DrainStatus, Drain, SendStatus, Send, ReceiveStatus, Receive, Register, Count };
+  static bool isCoe(MailboxRequest::Kind kind) {
+    return kind == MailboxRequest::Kind::Read || kind == MailboxRequest::Kind::Write;
+  }
   struct Queued { MailboxRequest::Ptr request; Clock::time_point queued; };
   void put16(size_t at, uint16_t value) { buffer_[at] = value; buffer_[at+1] = value >> 8; }
   uint16_t get16(size_t at) const { return buffer_[at] | (uint16_t(buffer_[at+1]) << 8); }
@@ -182,7 +203,7 @@ class AsyncMailbox {
   }
   void finish(MailboxStatus status, bool poison = false) {
     transport_.cancel();
-    if (poison) poisoned_[active_->slave] = true;
+    if (poison && active_->slave != 0) poisoned_[active_->slave] = true;
     active_->status.store(status, std::memory_order_release);
     active_.reset(); inFlight_ = false; sentMailbox_ = false;
   }

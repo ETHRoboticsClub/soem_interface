@@ -4,7 +4,8 @@
 #include <map>
 using namespace soem_interface_rsl;
 struct Wire : MailboxTransport {
-  bool flight=false, frozen=false, pending=false, unrelated=false, badSize=false, abort=false, badWkc=false;
+  bool flight=false, frozen=false, pending=false, unrelated=false, badSize=false, abort=false, badWkc=false, counting=false;
+  int answering=0;
   uint16_t reg=0, size=0, object=0; uint8_t sub=0, count=0;
   bool write=false, upload=false;
   int polls=0, submissions=0;
@@ -16,11 +17,15 @@ struct Wire : MailboxTransport {
   bool start(uint16_t, uint16_t r, bool w, const uint8_t* data,uint16_t n) override {
     assert(!flight);flight=true;reg=r;write=w;size=n;std::copy_n(data,n,tx.begin());++submissions;return true;
   }
+  bool startCount(uint16_t r) override {
+    assert(!flight);flight=true;counting=true;reg=r;++submissions;return true;
+  }
   int poll(uint8_t* data) override {
     ++polls;
     assert(flight);
     if(frozen)return -1;
     flight=false;
+    if(counting){counting=false;return answering;}
     if(badWkc)return 0;
     std::fill_n(data,size,0);
     if(reg==0x080d)data[0]=pending?8:0;
@@ -92,6 +97,15 @@ int main(){
   assert(box.submit(MailboxRequest::Kind::Read,2,0x603f,0,8)->status==MailboxStatus::Invalid);
   for(size_t i=0;i<AsyncMailbox::kQueueCapacity;++i)assert(box.submit(MailboxRequest::Kind::Read,2,0x603f,0,2)->status==MailboxStatus::Pending);
   assert(box.submit(MailboxRequest::Kind::Read,2,0x603f,0,2)->status==MailboxStatus::Unavailable);
+  box.disable();
+  // A broadcast count's working counter is its value, zero answering included.
+  box.enable(2);
+  for(int n : {3, 0}){
+    wire.answering=n;auto count=box.submit(MailboxRequest::Kind::Count,0,0x0000,0,2);
+    drive(box,wire,count);assert(count->status==MailboxStatus::Success && count->value==uint32_t(n));
+  }
+  assert(box.submit(MailboxRequest::Kind::Count,1,0x0000,0,2)->status==MailboxStatus::Unavailable);
+  assert(box.submit(MailboxRequest::Kind::Read,0,0x603f,0,2)->status==MailboxStatus::Unavailable);
   box.disable();
 }
 

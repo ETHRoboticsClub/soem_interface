@@ -167,6 +167,23 @@ class SOEM_RSL_EXPORT EthercatBusBase : private EthercatBusBaseTemplateAdapter {
   struct SlaveALStatus { bool observed; uint16_t state, code; };
   SlaveALStatus getSlaveALStatus(uint16_t slave) const;
   int getWorkingCounter() const;
+  // Slaves answering a broadcast beyond the configured slaves still answering
+  // at their station address: drives that rebooted or were absent at startup.
+  // Counted every kSlaveCountPeriod while cyclic; nullopt before the first count.
+  std::optional<int> getUnconfiguredResponders() const;
+  // Slaves that answered the last broadcast count; nullopt as above.
+  std::optional<int> getRespondingSlaves() const;
+  // A drive's logic supply settles within seconds; counting twice a second
+  // keeps the bus load at one tiny datagram per 500 ms while a return is
+  // still seen well within the master's settle time.
+  static constexpr std::chrono::milliseconds kSlaveCountPeriod{500};
+  // While the working counter stays low, the AL sweep repeats at this spacing
+  // so a slave's loss and return stay observed, not only the first shortfall;
+  // it matches the master's 250 ms bus monitor.
+  static constexpr std::chrono::milliseconds kDegradedSweepPeriod{250};
+  // Slaves answering a broadcast read on a bus that is not started (opens and
+  // closes the segment, writes nothing); -1 when started or not openable.
+  int probeSlaveCount();
   // True while the bus is in OP: the synchronous SDO calls are refused then
   // and callers must use requestSdo().
   bool cyclicActive() const;

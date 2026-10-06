@@ -258,7 +258,8 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     //! Check the working counter.
     if (wkc_ < expectedWorkingCounter) {
       ++workingCounterTooLowCounter_;
-      if (workingCounterTooLowCounter_ == 1) {
+      if (workingCounterTooLowCounter_ == 1 ||
+          (!diagnosticSweep_ && updateReadStamp_ - lastSweepEnd_ >= EthercatBusBase::kDegradedSweepPeriod)) {
         diagnosticSweep_ = true;
       }
       // The running count is part of the message, so one line per period already tells how long the bus has been degraded.
@@ -268,6 +269,14 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
       if (workingCounterTooLowCounter_ > maxWorkingCounterTooLow_) {
         MELO_ERROR_THROTTLE_STREAM(wkcTooLowLogPeriodSec_, "[soem_interface_rsl::" << getName() << "] Bus is not ok. Too many working counter too low in a row: "
                                                            << workingCounterTooLowCounter_)
+      }
+      // The working counter is one sum over the frame. When it equals exactly
+      // what the slaves the AL sweep sees exchanging contribute, their data is
+      // valid and only the others are withheld: one rebooted or unpowered slave
+      // does not stale the whole bus. Any other shortfall withholds everyone.
+      if (wkc_ != exchangingWorkingCounter()) return;
+      for (auto& slave : slaves_) {
+        if (exchanging(static_cast<uint16_t>(slave->getAddress()))) slave->updateRead();
       }
       return;
     }
@@ -419,12 +428,68 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
                                                        ((previous | state) & EC_STATE_ERROR);
         }
         busDiagnosisLog_.fullyUpdated = true;
+        lastSweepEnd_ = std::chrono::high_resolution_clock::now();
       }
     }
     if (diagnosticSweep_ && !slaves_.empty()) {
       diagnosticRequest_ = mailbox_.submit(MailboxRequest::Kind::Register,
           static_cast<uint16_t>(slaves_[diagnosticSlave_]->getAddress()), ECT_REG_ALSTAT, 0, 6);
     }
+    serviceSlaveCount();
+  }
+
+  // A slave exchanges process data in SAFE-OP and OP; one the sweep has not
+  // observed is assumed to.
+  bool exchanging(uint16_t address) const {
+    const uint32_t observed = observedAL_[address].load();
+    if (observed == kUnobservedAL) return true;
+    const uint16_t state = observed & 0x0f;
+    return state == EC_STATE_SAFE_OP || state == EC_STATE_OPERATIONAL;
+  }
+
+  // The working counter the slaves seen exchanging produce: 2 for outputs and
+  // 1 for inputs each, as SOEM's expected working counter counts them.
+  int exchangingWorkingCounter() {
+    int wkc = 0;
+    for (const auto& slave : slaves_) {
+      const auto address = static_cast<uint16_t>(slave->getAddress());
+      if (!exchanging(address)) continue;
+      wkc += (transport_->outputs(address).size > 0 ? 2 : 0) + (transport_->inputs(address).size > 0 ? 1 : 0);
+    }
+    return wkc;
+  }
+
+  // A slave that lost power forgets its station address, so the AL sweep can
+  // never see it return; only a broadcast does. Every answering slave that is
+  // not one of the configured slaves still answering at its station address is
+  // unconfigured: rebooted, or absent when the bus started. Counted between
+  // sweeps, against the last complete one.
+  void serviceSlaveCount() {
+    const auto now = std::chrono::high_resolution_clock::now();
+    if (countRequest_) {
+      const auto status = countRequest_->status.load(std::memory_order_acquire);
+      if (status == MailboxStatus::Pending) return;
+      if (status == MailboxStatus::Success) {
+        // A silent observation counts only while the exchange is short: once the
+        // working counter is full every configured slave answers, whatever a
+        // lost sweep read recorded.
+        const bool short_ = wkc_ < transport_->expectedWorkingCounter();
+        int answering = 0;
+        for (const auto& slave : slaves_)
+          answering += short_ && observedAL_[slave->getAddress()].load() == EC_STATE_NONE ? 0 : 1;
+        const int responding = static_cast<int>(countRequest_->value);
+        respondingSlaves_.store(responding);
+        unconfiguredResponders_.store(std::max(0, responding - answering));
+      } else {
+        // A link with no frame back is not a count.
+        respondingSlaves_.store(-1);
+        unconfiguredResponders_.store(-1);
+      }
+      countRequest_.reset();
+      nextCountAt_ = now + EthercatBusBase::kSlaveCountPeriod;
+    }
+    if (now < nextCountAt_ || diagnosticSweep_ || diagnosticRequest_) return;
+    countRequest_ = mailbox_.submit(MailboxRequest::Kind::Count, 0, ECT_REG_TYPE, 0, 2);
   }
 
   EthercatBusBase::SlaveALStatus getSlaveALStatus(uint16_t slave) const {
@@ -432,6 +497,21 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     return {value != kUnobservedAL, uint16_t(value), uint16_t(value >> 16)};
   }
   int getWorkingCounter() const { return wkc_.load(); }
+  std::optional<int> getUnconfiguredResponders() const {
+    const int value = unconfiguredResponders_.load();
+    return value < 0 ? std::nullopt : std::optional<int>(value);
+  }
+  std::optional<int> getRespondingSlaves() const {
+    const int value = respondingSlaves_.load();
+    return value < 0 ? std::nullopt : std::optional<int>(value);
+  }
+  int probeSlaveCount() {
+    std::lock_guard<std::mutex> guard(contextMutex_);
+    if (initlialized_ || !busIsAvailable() || !transport_->open()) return -1;
+    const int count = transport_->countSlaves();
+    transport_->close();
+    return count;
+  }
   bool cyclicActive() {
     std::lock_guard<std::mutex> guard(contextMutex_);
     return cyclicActive_;
@@ -699,6 +779,10 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
       for (auto& status : observedAL_) status.store(kUnobservedAL);
       diagnosticSlave_ = 0;
       diagnosticSweep_ = false;
+      countRequest_.reset();
+      unconfiguredResponders_.store(-1);
+      respondingSlaves_.store(-1);
+      nextCountAt_ = std::chrono::high_resolution_clock::now() + EthercatBusBase::kSlaveCountPeriod;
     }
     if (state == EC_STATE_OPERATIONAL) {
       transport_->sendProcessData();
@@ -913,6 +997,11 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
   std::array<std::atomic<uint32_t>, EC_MAXSLAVE> observedAL_{};
   size_t diagnosticSlave_{0};
   MailboxRequest::Ptr diagnosticRequest_;
+  std::chrono::time_point<std::chrono::high_resolution_clock> lastSweepEnd_{};
+  MailboxRequest::Ptr countRequest_;
+  std::chrono::time_point<std::chrono::high_resolution_clock> nextCountAt_{};
+  std::atomic<int> unconfiguredResponders_{-1};  // -1: no count since the bus entered OP
+  std::atomic<int> respondingSlaves_{-1};
 
 };
 
@@ -1141,6 +1230,11 @@ EthercatBusBase::SlaveALStatus EthercatBusBase::getSlaveALStatus(uint16_t slave)
   return pImpl_->getSlaveALStatus(slave);
 }
 int EthercatBusBase::getWorkingCounter() const { return pImpl_->getWorkingCounter(); }
+std::optional<int> EthercatBusBase::getUnconfiguredResponders() const {
+  return pImpl_->getUnconfiguredResponders();
+}
+std::optional<int> EthercatBusBase::getRespondingSlaves() const { return pImpl_->getRespondingSlaves(); }
+int EthercatBusBase::probeSlaveCount() { return pImpl_->probeSlaveCount(); }
 bool EthercatBusBase::cyclicActive() const { return pImpl_->cyclicActive(); }
 
 }  // namespace soem_interface_rsl

@@ -60,8 +60,10 @@ public:
   virtual bool open() = 0;
   virtual void close() = 0;
 
-  // Slaves answering on the segment; configures nothing.
+  // Slaves answering on the segment; resets every slave to INIT first.
   virtual int detectSlaves() = 0;
+  // Slaves answering one broadcast read; writes nothing.
+  virtual int countSlaves() = 0;
   // Reads every slave's identity, sets up mailboxes and requests PRE-OP.
   // Returns the slave count; <= 0 means the scan failed.
   virtual int enumerate() = 0;
