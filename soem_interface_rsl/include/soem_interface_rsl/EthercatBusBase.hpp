@@ -103,6 +103,11 @@ class SOEM_RSL_EXPORT EthercatBusBase : private EthercatBusBaseTemplateAdapter {
    */
   const std::string& getName() const;
 
+  // Physical input production time accepted with this slave's latest Reading.
+  // Nullopt means process-data receipt itself is authoritative.
+  std::optional<std::chrono::steady_clock::time_point>
+  getProcessDataSourceTime(uint16_t slave) const;
+
   /*!
    * Check if a NIC is available to SOEM.
    * @param name Name of the bus.

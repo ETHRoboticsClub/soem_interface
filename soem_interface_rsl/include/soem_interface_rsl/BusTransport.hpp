@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <soem_interface_rsl/AsyncMailbox.hpp>
@@ -81,6 +82,12 @@ public:
   virtual void sendProcessData() = 0;
   // Working counter of the returned frame; < 0 when nothing came back.
   virtual int receiveProcessData(std::chrono::microseconds timeout) = 0;
+  // Physical input production time when the transport has a distinct upstream
+  // producer. Nullopt means process-data receipt is the source time. An engaged
+  // zero time means that producer has not published its first complete frame.
+  virtual std::optional<std::chrono::steady_clock::time_point> processDataSourceTime() const {
+    return std::nullopt;
+  }
 
   // AL control write; slave 0 addresses every slave.
   virtual void requestAlState(uint16_t slave, uint16_t state) = 0;
