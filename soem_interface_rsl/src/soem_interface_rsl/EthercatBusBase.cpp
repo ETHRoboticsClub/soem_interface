@@ -43,6 +43,13 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
   const std::string& getName() const { return transport_->name(); }
 
+  std::optional<std::chrono::steady_clock::time_point>
+  getProcessDataSourceTime(uint16_t slave) const {
+    std::lock_guard<std::mutex> guard(sourceTimeMutex_);
+    if (slave >= processDataSourceTimes_.size()) return std::nullopt;
+    return processDataSourceTimes_[slave];
+  }
+
   bool busIsAvailable() const { return transport_->available(); }
 
   int getNumberOfSlaves() const {
@@ -68,6 +75,14 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     // ensure that they are sorted in adress order. this makes access simpler (access via slaveaddress -1)
     std::sort(slaves_.begin(), slaves_.end(),
               [](const EthercatSlaveBasePtr& a, const EthercatSlaveBasePtr& b) -> bool { return a->getAddress() < b->getAddress(); });
+    {
+      std::lock_guard<std::mutex> guard(sourceTimeMutex_);
+      processDataSourceTimes_.resize(std::max(
+          processDataSourceTimes_.size(), static_cast<std::size_t>(slave->getAddress()) + 1));
+      // A fake producer advertises an engaged zero before its first complete
+      // frame; preserve that distinction from real SOEM's nullopt fallback.
+      processDataSourceTimes_[slave->getAddress()] = transport_->processDataSourceTime();
+    }
     return true;
   }
 
@@ -247,9 +262,11 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
     //! Receive the EtherCAT data.
     updateReadStamp_ = std::chrono::high_resolution_clock::now();
+    std::optional<std::chrono::steady_clock::time_point> sourceTime;
     {
       std::lock_guard<std::mutex> guard(contextMutex_);
       wkc_ = transport_->receiveProcessData(std::chrono::microseconds(EC_TIMEOUTRET));
+      sourceTime = transport_->processDataSourceTime();
     }
     sentProcessData_ = false;
     serviceMailbox();
@@ -278,6 +295,13 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
       for (auto& slave : slaves_) {
         if (exchanging(static_cast<uint16_t>(slave->getAddress()))) slave->updateRead();
       }
+      {
+        std::lock_guard<std::mutex> guard(sourceTimeMutex_);
+        for (const auto& slave : slaves_) {
+          const auto address = static_cast<uint16_t>(slave->getAddress());
+          if (exchanging(address)) processDataSourceTimes_[address] = sourceTime;
+        }
+      }
       return;
     }
     // Reset working counter too low counter.
@@ -286,6 +310,11 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
     //! Each slave attached to this bus reads its data to the buffer.
     for (auto& slave : slaves_) {
       slave->updateRead();
+    }
+    {
+      std::lock_guard<std::mutex> guard(sourceTimeMutex_);
+      for (const auto& slave : slaves_)
+        processDataSourceTimes_[static_cast<uint16_t>(slave->getAddress())] = sourceTime;
     }
   }
 
@@ -959,6 +988,8 @@ struct EthercatBusBaseTemplateAdapter::EthercatSlaveBaseImpl {
 
   //! List of slaves.
   std::vector<EthercatSlaveBasePtr> slaves_;
+  mutable std::mutex sourceTimeMutex_;
+  std::vector<std::optional<std::chrono::steady_clock::time_point>> processDataSourceTimes_;
 
   //! Bool indicating whether PDO data has been sent and not read yet.
   bool sentProcessData_{false};
@@ -1052,6 +1083,11 @@ void EthercatBusBase::printAvailableBusses() {
 
 const std::string& EthercatBusBase::getName() const {
   return pImpl_->getName();
+}
+
+std::optional<std::chrono::steady_clock::time_point>
+EthercatBusBase::getProcessDataSourceTime(uint16_t slave) const {
+  return pImpl_->getProcessDataSourceTime(slave);
 }
 
 bool EthercatBusBase::busIsAvailable() const {
