@@ -1,10 +1,15 @@
 // The SOEM adapter behind BusTransport: every ecx_* call of the bus lives here.
 #include <soem_interface_rsl/BusTransport.hpp>
 
+#include "ProcessDataGuard.hpp"
+
 #include <message_logger/message_logger.hpp>
 #include <soem_rsl/ethercat.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace soem_interface_rsl {
@@ -108,6 +113,7 @@ public:
     return wkc < 0 ? 0 : wkc;
   }
   int enumerate() override {
+    unsealGroups();
     const int count = ecx_config_init(&context_, FALSE);
     // Disable symmetrical transfers.
     context_.grouplist[0].blockLRW = 1;
@@ -119,7 +125,15 @@ public:
     return {address, std::string(s.name), s.eep_man, s.eep_id, s.eep_rev, s.configadr};
   }
 
-  int mapProcessImage() override { return ecx_config_map_group(&context_, &ioMap_, 0); }
+  int mapProcessImage() override {
+    unsealGroups();
+    const int size = ecx_config_map_group(&context_, &ioMap_, 0);
+    // SOEM writes the group table only while enumerating and mapping; sealed, any later
+    // write faults in the writer instead of corrupting the receive's IO-map pointers.
+    if (!groups_.seal())
+      MELO_WARN_STREAM("[soem_interface_rsl::" << name_ << "] group table stays writable: " << std::strerror(errno));
+    return size;
+  }
   ProcessDataView outputs(uint16_t slave) override {
     auto& s = context_.slavelist[slave];
     return {s.outputs, static_cast<uint16_t>(s.Obytes)};
@@ -131,9 +145,18 @@ public:
   int expectedWorkingCounter() const override {
     return context_.grouplist[0].outputsWKC * 2 + context_.grouplist[0].inputsWKC;
   }
-  void sendProcessData() override { ecx_send_processdata(&context_); }
+  void sendProcessData() override {
+    ecx_send_processdata(&context_);
+    const auto outside = indexStackOutsideMap(idxStack_, ioMap_, sizeof(ioMap_));
+    if (!outside.empty()) fatal("the send queued replies outside the IO map: " + outside);
+    sent_ = idxStack_;
+  }
   int receiveProcessData(std::chrono::microseconds timeout) override {
-    return ecx_receive_processdata(&context_, static_cast<int>(timeout.count()));
+    const auto changed = indexStackDifference(sent_, idxStack_);
+    if (!changed.empty()) fatal("the queued replies changed between send and receive: " + changed);
+    const int wkc = ecx_receive_processdata(&context_, static_cast<int>(timeout.count()));
+    sent_ = idxStack_;
+    return wkc;
   }
 
   void requestAlState(uint16_t slave, uint16_t state) override {
@@ -221,6 +244,17 @@ public:
   MailboxTransport& mailbox() override { return mailbox_; }
 
 private:
+  void unsealGroups() {
+    if (!groups_.unseal())
+      MELO_WARN_STREAM("[soem_interface_rsl::" << name_ << "] group table stays read-only: " << std::strerror(errno));
+  }
+
+  // stderr, unbuffered: the report must be out before the abort.
+  [[noreturn]] void fatal(const std::string& what) const {
+    std::fprintf(stderr, "soem_interface_rsl::%s: FATAL: %s\n", name_.c_str(), what.c_str());
+    std::abort();
+  }
+
   std::string name_;
   bool open_{false};
 
@@ -235,8 +269,8 @@ private:
   ec_slavet slavelist_[EC_MAXSLAVE];
   // Number of slaves found in the network.
   int slavecount_{0};
-  // Slave group structure.
-  ec_groupt grouplist_[EC_MAXGROUP];
+  // Slave group structure, sealed once the process image is mapped.
+  SealablePages<ec_groupt, EC_MAXGROUP> groups_;
   // Internal, reference to EEPROM cache buffer.
   uint8 esiBuf_[EC_MAXEEPBUF];
   // Internal, reference to EEPROM cache map.
@@ -244,7 +278,9 @@ private:
   // Internal, reference to error list.
   ec_eringt eList_;
   // Internal, reference to processdata stack buffer info.
-  ec_idxstackT idxStack_;
+  ec_idxstackT idxStack_{};
+  // idxStack_ as the last send or receive left it.
+  ec_idxstackT sent_{};
   // Boolean indicating if an error is available in error stack.
   boolean error_{FALSE};
   // Reference to last DC time from slaves.
@@ -267,7 +303,7 @@ private:
                            &slavelist_[0],
                            &slavecount_,
                            EC_MAXSLAVE,
-                           &grouplist_[0],
+                           groups_.data(),
                            EC_MAXGROUP,
                            &esiBuf_[0],
                            &esiMap_[0],
